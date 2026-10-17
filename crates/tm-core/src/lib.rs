@@ -3,8 +3,10 @@
 
 mod app;
 mod gpu;
+mod services;
 
-pub use app::app_from_cgroup;
+pub use app::{app_from_cgroup, service_unit_from_cgroup};
+pub use services::{ServiceInfo, list_services};
 
 use gpu::GpuCounters;
 use procfs::process::Stat;
