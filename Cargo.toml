@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = ["crates/tm-core", "crates/tm-cli"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

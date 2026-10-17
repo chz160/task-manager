@@ -1,0 +1,13 @@
+import { ListView, StandardTableView } from "std-widgets.slint";
+
+export component Table inherits Window {
+    in property <[[StandardListViewItem]]> rows;
+    preferred-width: 700px;
+    preferred-height: 500px;
+    StandardTableView {
+        columns: [
+            { title: "PID" }, { title: "Name" }, { title: "CPU %" }, { title: "Mem MiB" },
+        ];
+        rows: root.rows;
+    }
+}

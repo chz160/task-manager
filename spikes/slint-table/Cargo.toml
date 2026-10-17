@@ -1,0 +1,15 @@
+[package]
+name = "spike-slint-table"
+version = "0.0.0"
+edition = "2021"
+publish = false
+build = "build.rs"
+
+# Standalone workspace: keeps the spike out of the main CI build.
+[workspace]
+
+[dependencies]
+slint = { version = "1", default-features = false, features = ["std", "backend-winit", "renderer-software", "compat-1-2"] }
+
+[build-dependencies]
+slint-build = "1"
