@@ -1,4 +1,4 @@
-import { Button, ComboBox, StandardTableView, TabWidget, Palette } from "std-widgets.slint";
+import { Button, CheckBox, ComboBox, StandardTableView, TabWidget, Palette } from "std-widgets.slint";
 
 export struct GraphData {
     label: string,
@@ -53,8 +53,11 @@ export component MainWindow inherits Window {
     min-height: 380px;
 
     in property <[[StandardListViewItem]]> process-rows;
+    in property <[[StandardListViewItem]]> detail-rows;
     in property <[[StandardListViewItem]]> user-rows;
     in-out property <int> selected-row: -1;
+    in-out property <int> detail-selected-row: -1;
+    in-out property <int> current-tab: 0;
 
     in property <string> cpu-text;
     in property <string> cpu-commands;
@@ -68,10 +71,13 @@ export component MainWindow inherits Window {
     in-out property <string> message;
     in-out property <bool> confirming;
 
-    callback sort-ascending(int);
-    callback sort-descending(int);
-    callback row-selected(int);
-    callback end-process-clicked();
+    // The first argument says which process table: 0 = Processes, 1 = Details.
+    callback sort-ascending(int, int);
+    callback sort-descending(int, int);
+    callback row-selected(int, int);
+    callback tab-selected(int);
+    callback group-toggled(bool);
+    callback end-process-clicked(int);
     callback end-process-confirmed();
     callback message-dismissed();
     callback interval-selected(int);
@@ -81,6 +87,8 @@ export component MainWindow inherits Window {
         spacing: 8px;
 
         TabWidget {
+            current-index <=> root.current-tab;
+            changed current-index => { root.tab-selected(self.current-index); }
             Tab {
                 title: "Processes";
                 VerticalLayout {
@@ -91,24 +99,30 @@ export component MainWindow inherits Window {
                             { title: "PID", min-width: 70px },
                             { title: "User Name", min-width: 120px },
                             { title: "CPU %", min-width: 90px },
-                            { title: "Memory (PSS)", min-width: 110px },
-                            { title: "Memory (RSS)", min-width: 110px },
+                            { title: "Memory", min-width: 100px },
+                            { title: "RSS", min-width: 100px },
                             { title: "Disk", min-width: 90px },
                             { title: "GPU", min-width: 60px },
-                            { title: "Threads", min-width: 70px },
+                            { title: "Threads", min-width: 80px },
                         ];
                         rows: root.process-rows;
                         current-row <=> root.selected-row;
-                        sort-ascending(c) => { root.sort-ascending(c); }
-                        sort-descending(c) => { root.sort-descending(c); }
-                        current-row-changed(r) => { root.row-selected(r); }
+                        sort-ascending(c) => { root.sort-ascending(0, c); }
+                        sort-descending(c) => { root.sort-descending(0, c); }
+                        current-row-changed(r) => { root.row-selected(0, r); }
                     }
                     HorizontalLayout {
-                        alignment: end;
+                        spacing: 8px;
+                        CheckBox {
+                            text: "Group by application";
+                            checked: true;
+                            toggled => { root.group-toggled(self.checked); }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
                         Button {
                             text: "End Process";
                             enabled: root.selected-row >= 0;
-                            clicked => { root.end-process-clicked(); }
+                            clicked => { root.end-process-clicked(0); }
                         }
                     }
                 }
@@ -158,6 +172,39 @@ export component MainWindow inherits Window {
                             { title: "Memory (RSS)", min-width: 130px },
                         ];
                         rows: root.user-rows;
+                    }
+                }
+            }
+            Tab {
+                title: "Details";
+                VerticalLayout {
+                    spacing: 8px;
+                    StandardTableView {
+                        columns: [
+                            { title: "Name", min-width: 130px },
+                            { title: "PID", min-width: 70px },
+                            { title: "Status", min-width: 90px },
+                            { title: "User Name", min-width: 100px },
+                            { title: "CPU %", min-width: 70px },
+                            { title: "Memory", min-width: 100px },
+                            { title: "Disk", min-width: 90px },
+                            { title: "GPU", min-width: 60px },
+                            { title: "Threads", min-width: 80px },
+                            { title: "Command line", min-width: 300px, horizontal-stretch: 1 },
+                        ];
+                        rows: root.detail-rows;
+                        current-row <=> root.detail-selected-row;
+                        sort-ascending(c) => { root.sort-ascending(1, c); }
+                        sort-descending(c) => { root.sort-descending(1, c); }
+                        current-row-changed(r) => { root.row-selected(1, r); }
+                    }
+                    HorizontalLayout {
+                        alignment: end;
+                        Button {
+                            text: "End Process";
+                            enabled: root.detail-selected-row >= 0;
+                            clicked => { root.end-process-clicked(1); }
+                        }
                     }
                 }
             }
