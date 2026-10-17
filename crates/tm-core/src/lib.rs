@@ -1,0 +1,154 @@
+//! Stateful `/proc` sampler. CPU percentages need two samples, so the
+//! sampler keeps the previous counters between calls to [`Sampler::sample`].
+
+use procfs::process::all_processes;
+use procfs::{CpuTime, Current, CurrentSI, KernelStats, Meminfo};
+use std::collections::HashMap;
+
+#[derive(Debug, Clone)]
+pub struct MemInfo {
+    pub total_kib: u64,
+    pub available_kib: u64,
+    pub swap_total_kib: u64,
+    pub swap_free_kib: u64,
+}
+
+impl MemInfo {
+    pub fn used_kib(&self) -> u64 {
+        self.total_kib.saturating_sub(self.available_kib)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProcessInfo {
+    pub pid: i32,
+    pub ppid: i32,
+    pub name: String,
+    pub state: char,
+    pub threads: i64,
+    pub uid: Option<u32>,
+    pub rss_kib: u64,
+    /// Share of total system CPU (0..=100), Windows style. 0 on the first sample.
+    pub cpu_percent: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    /// Overall CPU busy percentage. 0 on the first sample.
+    pub cpu_percent: f64,
+    pub per_core_percent: Vec<f64>,
+    pub mem: MemInfo,
+    pub processes: Vec<ProcessInfo>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct CoreTicks {
+    busy: u64,
+    total: u64,
+}
+
+fn core_ticks(t: &CpuTime) -> CoreTicks {
+    // guest time is already included in user/nice.
+    let idle = t.idle + t.iowait.unwrap_or(0);
+    let total = t.user
+        + t.nice
+        + t.system
+        + t.idle
+        + t.iowait.unwrap_or(0)
+        + t.irq.unwrap_or(0)
+        + t.softirq.unwrap_or(0)
+        + t.steal.unwrap_or(0);
+    CoreTicks {
+        busy: total - idle,
+        total,
+    }
+}
+
+fn percent(prev: CoreTicks, cur: CoreTicks) -> f64 {
+    let dt = cur.total.saturating_sub(prev.total);
+    if dt == 0 {
+        return 0.0;
+    }
+    cur.busy.saturating_sub(prev.busy) as f64 / dt as f64 * 100.0
+}
+
+#[derive(Default)]
+pub struct Sampler {
+    prev_total: Option<CoreTicks>,
+    prev_cores: Vec<CoreTicks>,
+    /// (pid, starttime) -> utime+stime. Start time guards against PID reuse.
+    prev_procs: HashMap<(i32, u64), u64>,
+    prev_total_all_cores: u64,
+}
+
+impl Sampler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn sample(&mut self) -> procfs::ProcResult<Snapshot> {
+        let ks = KernelStats::current()?;
+        let total = core_ticks(&ks.total);
+        let cores: Vec<CoreTicks> = ks.cpu_time.iter().map(core_ticks).collect();
+
+        let cpu_percent = self.prev_total.map_or(0.0, |p| percent(p, total));
+        let per_core_percent = cores
+            .iter()
+            .enumerate()
+            .map(|(i, c)| self.prev_cores.get(i).map_or(0.0, |p| percent(*p, *c)))
+            .collect();
+
+        // Aggregate "cpu" line sums all cores, so one process can use at most
+        // total_delta / ncores; scale to the whole machine like Windows does.
+        let total_delta = total.total.saturating_sub(self.prev_total_all_cores);
+        let denom = if self.prev_total.is_some() {
+            total_delta as f64
+        } else {
+            0.0
+        };
+
+        let page_kib = procfs::page_size() / 1024;
+        let mut next_procs = HashMap::with_capacity(self.prev_procs.len());
+        let mut processes = Vec::new();
+        for p in all_processes()?.flatten() {
+            // Processes can exit between listing and reading; skip them.
+            let Ok(stat) = p.stat() else { continue };
+            let ticks = stat.utime + stat.stime;
+            let key = (stat.pid, stat.starttime);
+            let cpu = match (self.prev_procs.get(&key), denom > 0.0) {
+                (Some(prev), true) => ticks.saturating_sub(*prev) as f64 / denom * 100.0,
+                _ => 0.0,
+            };
+            next_procs.insert(key, ticks);
+            processes.push(ProcessInfo {
+                pid: stat.pid,
+                ppid: stat.ppid,
+                name: stat.comm,
+                state: stat.state,
+                threads: stat.num_threads,
+                uid: p.uid().ok(),
+                rss_kib: stat.rss * page_kib,
+                cpu_percent: cpu,
+            });
+        }
+
+        let mi = Meminfo::current()?;
+        let mem = MemInfo {
+            total_kib: mi.mem_total / 1024,
+            available_kib: mi.mem_available.unwrap_or(mi.mem_free) / 1024,
+            swap_total_kib: mi.swap_total / 1024,
+            swap_free_kib: mi.swap_free / 1024,
+        };
+
+        self.prev_total = Some(total);
+        self.prev_cores = cores;
+        self.prev_procs = next_procs;
+        self.prev_total_all_cores = total.total;
+        Ok(Snapshot {
+            cpu_percent,
+            per_core_percent,
+            mem,
+            processes,
+        })
+    }
+}
