@@ -1,0 +1,11 @@
+[package]
+name = "spike-gtk-table"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone workspace: keeps GTK dev libraries out of the main CI build.
+[workspace]
+
+[dependencies]
+gtk4 = "0.9"
