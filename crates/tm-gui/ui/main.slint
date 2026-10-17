@@ -172,8 +172,8 @@ export component MainWindow inherits Window {
                 vertical-alignment: center;
             }
             ComboBox {
-                model: ["High (0.5 s)", "Normal (1 s)", "Low (4 s)", "Paused"];
-                current-index: 1;
+                model: ["1 s", "2 s", "5 s", "10 s"];
+                current-index: 0;
                 selected(_) => { root.interval-selected(self.current-index); }
             }
         }
