@@ -21,7 +21,7 @@ The refresh rate (0.5 s, 1 s, 4 s or paused) is in the bottom right.
 cargo run --release -p tm-gui
 ```
 
-Runtime needs: an X11 or Wayland session. On X11, `libxkbcommon-x11` must be installed (Debian/Ubuntu: `libxkbcommon-x11-0`). Slint is used under its royalty-free license terms.
+Building needs `libfontconfig1-dev` (Debian/Ubuntu). Runtime needs: an X11 or Wayland session. On X11, `libxkbcommon-x11` must be installed (Debian/Ubuntu: `libxkbcommon-x11-0`). Slint is used under its royalty-free license terms.
 
 ### Ending other users' processes
 
