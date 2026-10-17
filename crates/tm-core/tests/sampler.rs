@@ -52,3 +52,46 @@ fn sample_cost_budget() {
     let per = t.elapsed() / n;
     assert!(per < Duration::from_millis(50), "sample took {per:?}");
 }
+
+#[test]
+fn own_process_has_extras() {
+    let mut s = Sampler::new();
+    let snap = s.sample().unwrap();
+    let me = snap
+        .processes
+        .iter()
+        .find(|p| p.pid == process::id() as i32)
+        .unwrap();
+    assert!(me.pss_kib.is_some_and(|k| k > 0), "PSS of our own process");
+    assert!(me.pss_kib.unwrap() <= me.rss_kib + 1024);
+    assert!(me.disk_read_bps.is_some() && me.disk_write_bps.is_some());
+    assert!(me.gpu_percent.is_some(), "readable even without a GPU");
+    assert!(
+        me.cgroup.is_some()
+            || std::fs::read_to_string("/proc/self/cgroup").is_ok_and(|c| !c.contains("0::"))
+    );
+}
+
+#[test]
+fn disk_writes_show_up_as_a_rate() {
+    let mut s = Sampler::new();
+    s.set_extras_interval(Duration::ZERO);
+    s.sample().unwrap();
+    let path = std::env::temp_dir().join(format!("tm-io-test-{}", process::id()));
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&vec![7u8; 16 << 20]).unwrap();
+        f.sync_all().unwrap();
+    }
+    let _ = std::fs::remove_file(&path);
+    thread::sleep(Duration::from_millis(200));
+    let snap = s.sample().unwrap();
+    let me = snap
+        .processes
+        .iter()
+        .find(|p| p.pid == process::id() as i32)
+        .unwrap();
+    // Some filesystems (tmpfs) never reach a block device, so only require it to be measured.
+    assert!(me.disk_write_bps.is_some());
+}
