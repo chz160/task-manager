@@ -32,12 +32,30 @@ pids+=($gui)
 # utime+stime in clock ticks; strip "pid (comm) " first because comm may contain spaces.
 ticks() { sed 's/^.*) //' "/proc/$gui/stat" | awk '{print $12 + $13}'; }
 
+# Informational: the floor for any monitor is one open/read/close of /proc/<pid>/stat per process.
+python3 - <<'PY'
+import os, time
+pids = [p for p in os.listdir('/proc') if p.isdigit()]
+t = time.perf_counter()
+for _ in range(20):
+    for p in pids:
+        try:
+            fd = os.open(f'/proc/{p}/stat', os.O_RDONLY)
+            os.read(fd, 4096)
+            os.close(fd)
+        except OSError:
+            pass
+ms = (time.perf_counter() - t) / 20 * 1000
+print(f"floor: reading stat of {len(pids)} processes takes {ms:.1f} ms per sweep = {ms / 10:.2f}% of a core at 1 s")
+PY
+
 sleep "$WARMUP"
 kill -0 "$gui" # fail if the GUI crashed on startup
 t0=$(ticks)
 sleep "$WINDOW"
 kill -0 "$gui"
 t1=$(ticks)
+for t in /proc/$gui/task/*; do echo "thread $(cat "$t/comm"): $(sed 's/^.*) //' "$t/stat" | awk '{print $12 + $13}') ticks total"; done
 rss_kib=$(awk '/VmRSS/ {print $2}' "/proc/$gui/status")
 
 hz=$(getconf CLK_TCK)
