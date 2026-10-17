@@ -1,0 +1,215 @@
+import { Button, ComboBox, StandardTableView, TabWidget, Palette } from "std-widgets.slint";
+
+export struct GraphData {
+    label: string,
+    commands: string,
+}
+
+// Dark grid with a filled history line, in the style of the Windows 7 Performance tab.
+component Graph inherits Rectangle {
+    in property <string> commands;
+    in property <color> line: #3fdc5a;
+    background: #0b1a0b;
+    border-width: 1px;
+    border-color: #3a5a3a;
+    for i in 3: Rectangle {
+        y: parent.height * (i + 1) / 4;
+        height: 1px;
+        background: #1e3a1e;
+    }
+    Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 100;
+        viewbox-height: 100;
+        commands: root.commands;
+        fill: root.line.with-alpha(0.25);
+        stroke: root.line;
+        stroke-width: 1px;
+    }
+}
+
+component LabeledGraph inherits VerticalLayout {
+    in property <string> title;
+    in property <string> value;
+    in property <string> commands;
+    in property <color> line: #3fdc5a;
+    spacing: 4px;
+    Text {
+        text: root.title + "  " + root.value;
+        font-weight: 600;
+    }
+    Graph {
+        commands: root.commands;
+        line: root.line;
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "Task Manager";
+    preferred-width: 760px;
+    preferred-height: 560px;
+    min-width: 520px;
+    min-height: 380px;
+
+    in property <[[StandardListViewItem]]> process-rows;
+    in property <[[StandardListViewItem]]> user-rows;
+    in-out property <int> selected-row: -1;
+
+    in property <string> cpu-text;
+    in property <string> cpu-commands;
+    in property <string> mem-text;
+    in property <string> mem-commands;
+    in property <[GraphData]> cores;
+    in property <string> stats-text;
+    in property <string> status-text;
+
+    // Set by Rust: non-empty text shows the message box; `confirming` picks the Yes/No form.
+    in-out property <string> message;
+    in-out property <bool> confirming;
+
+    callback sort-ascending(int);
+    callback sort-descending(int);
+    callback row-selected(int);
+    callback end-process-clicked();
+    callback end-process-confirmed();
+    callback message-dismissed();
+    callback interval-selected(int);
+
+    VerticalLayout {
+        padding: 8px;
+        spacing: 8px;
+
+        TabWidget {
+            Tab {
+                title: "Processes";
+                VerticalLayout {
+                    spacing: 8px;
+                    StandardTableView {
+                        columns: [
+                            { title: "Image Name", min-width: 140px, horizontal-stretch: 1 },
+                            { title: "PID", min-width: 70px },
+                            { title: "User Name", min-width: 120px },
+                            { title: "CPU %", min-width: 90px },
+                            { title: "Memory (RSS)", min-width: 130px },
+                            { title: "Threads", min-width: 90px },
+                        ];
+                        rows: root.process-rows;
+                        current-row <=> root.selected-row;
+                        sort-ascending(c) => { root.sort-ascending(c); }
+                        sort-descending(c) => { root.sort-descending(c); }
+                        current-row-changed(r) => { root.row-selected(r); }
+                    }
+                    HorizontalLayout {
+                        alignment: end;
+                        Button {
+                            text: "End Process";
+                            enabled: root.selected-row >= 0;
+                            clicked => { root.end-process-clicked(); }
+                        }
+                    }
+                }
+            }
+            Tab {
+                title: "Performance";
+                VerticalLayout {
+                    spacing: 10px;
+                    LabeledGraph {
+                        title: "CPU Usage";
+                        value: root.cpu-text;
+                        commands: root.cpu-commands;
+                        vertical-stretch: 2;
+                    }
+                    LabeledGraph {
+                        title: "Physical Memory";
+                        value: root.mem-text;
+                        commands: root.mem-commands;
+                        line: #4aa3ff;
+                        vertical-stretch: 2;
+                    }
+                    GridLayout {
+                        spacing: 6px;
+                        vertical-stretch: 2;
+                        for core[i] in root.cores: LabeledGraph {
+                            row: floor(i / 4);
+                            col: mod(i, 4);
+                            title: core.label;
+                            commands: core.commands;
+                            line: #e0c040;
+                        }
+                    }
+                    Text {
+                        text: root.stats-text;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+            Tab {
+                title: "Users";
+                VerticalLayout {
+                    StandardTableView {
+                        columns: [
+                            { title: "User Name", min-width: 140px, horizontal-stretch: 1 },
+                            { title: "Processes", min-width: 100px },
+                            { title: "CPU %", min-width: 90px },
+                            { title: "Memory (RSS)", min-width: 130px },
+                        ];
+                        rows: root.user-rows;
+                    }
+                }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 12px;
+            Text {
+                text: root.status-text;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            Text {
+                text: "Refresh:";
+                vertical-alignment: center;
+            }
+            ComboBox {
+                model: ["High (0.5 s)", "Normal (1 s)", "Low (4 s)", "Paused"];
+                current-index: 1;
+                selected(_) => { root.interval-selected(self.current-index); }
+            }
+        }
+    }
+
+    if root.message != "" : Rectangle {
+        background: #00000088;
+        TouchArea { }
+        Rectangle {
+            width: min(parent.width - 32px, 420px);
+            height: dialog.preferred-height + 32px;
+            background: Palette.background;
+            border-color: Palette.border;
+            border-width: 1px;
+            border-radius: 6px;
+            dialog := VerticalLayout {
+                padding: 16px;
+                spacing: 16px;
+                Text {
+                    text: root.message;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+                    if root.confirming : Button {
+                        text: "End process";
+                        primary: true;
+                        clicked => { root.end-process-confirmed(); }
+                    }
+                    Button {
+                        text: root.confirming ? "Cancel" : "OK";
+                        clicked => { root.message-dismissed(); }
+                    }
+                }
+            }
+        }
+    }
+}

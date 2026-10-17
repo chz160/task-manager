@@ -1,0 +1,15 @@
+[package]
+name = "tm-gui"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+build = "build.rs"
+
+[dependencies]
+tm-core = { version = "0.1.0", path = "../tm-core" }
+libc = "0.2"
+# Royalty-free license terms (https://slint.dev/terms-and-conditions#royalty-free); this repo is MIT.
+slint = { version = "1", default-features = false, features = ["std", "backend-winit", "renderer-software", "software-renderer-systemfonts", "compat-1-2"] }
+
+[build-dependencies]
+slint-build = "1"
