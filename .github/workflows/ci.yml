@@ -31,7 +31,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y xvfb libxkbcommon-x11-0 fonts-dejavu-core libfontconfig1-dev
       - run: cargo build --release -p tm-gui
-      - name: CPU budget (<1% of a core at 1 s refresh, ~1000 processes)
+      - name: CPU budget (<2% of a core at 1 s refresh, ~1000 processes)
         run: scripts/perf-check.sh target/release/tm-gui
       - uses: actions/upload-artifact@v4
         with:
