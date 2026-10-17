@@ -66,6 +66,14 @@ pub struct ProcessInfo {
     pub gpu_mem_kib: Option<u64>,
     /// Unified-hierarchy cgroup path, e.g. `/user.slice/.../app-gnome-firefox-1.scope`.
     pub cgroup: Option<Arc<str>>,
+    /// Arguments joined by spaces; `None` for kernel threads and unreadable processes.
+    pub cmdline: Option<Arc<str>>,
+}
+
+impl AsRef<ProcessInfo> for ProcessInfo {
+    fn as_ref(&self) -> &ProcessInfo {
+        self
+    }
 }
 
 impl ProcessInfo {
@@ -143,6 +151,7 @@ struct ProcPrev {
     /// A process never changes owner or (in practice) cgroup, so look them up once.
     uid: Option<u32>,
     cgroup: Option<Arc<str>>,
+    cmdline: Option<Arc<str>>,
     extras: Extras,
 }
 
@@ -192,6 +201,38 @@ fn parse_io(text: &str) -> Option<(u64, u64)> {
 fn read_cgroup(pid: i32) -> Option<Arc<str>> {
     let text = read_small(&format!("/proc/{pid}/cgroup"))?;
     parse_cgroup(&text).map(Arc::from)
+}
+
+const CMDLINE_MAX: usize = 4096;
+
+fn read_cmdline(pid: i32) -> Option<Arc<str>> {
+    let mut buf = Vec::with_capacity(256);
+    File::open(format!("/proc/{pid}/cmdline"))
+        .ok()?
+        .take(CMDLINE_MAX as u64)
+        .read_to_end(&mut buf)
+        .ok()?;
+    parse_cmdline(&buf, buf.len() >= CMDLINE_MAX).map(Arc::from)
+}
+
+/// Arguments are NUL-separated. Kernel threads have none.
+fn parse_cmdline(raw: &[u8], truncated: bool) -> Option<String> {
+    let mut args: Vec<&[u8]> = raw.split(|b| *b == 0).collect();
+    while args.last().is_some_and(|a| a.is_empty()) {
+        args.pop();
+    }
+    if args.is_empty() {
+        return None;
+    }
+    let mut out = args
+        .iter()
+        .map(|a| String::from_utf8_lossy(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if truncated {
+        out.push('…');
+    }
+    Some(out)
 }
 
 /// cgroup v2 has a single `0::<path>` line; on a v1 or hybrid system there is none and
@@ -358,11 +399,12 @@ impl Sampler {
                 (Some(prev), true) => ticks.saturating_sub(prev.ticks) as f64 / denom * 100.0,
                 _ => 0.0,
             };
-            let (uid, cgroup, mut extras, fresh) = match prev {
-                Some(p) => (p.uid, p.cgroup, p.extras, false),
+            let (uid, cgroup, cmdline, mut extras, fresh) = match prev {
+                Some(p) => (p.uid, p.cgroup, p.cmdline, p.extras, false),
                 None => (
                     fs::metadata(format!("/proc/{pid}")).ok().map(|m| m.uid()),
                     read_cgroup(pid),
+                    read_cmdline(pid),
                     Extras::default(),
                     true,
                 ),
@@ -397,6 +439,7 @@ impl Sampler {
                 gpu_percent: extras.gpu_percent,
                 gpu_mem_kib: extras.gpu_mem_kib,
                 cgroup: cgroup.clone(),
+                cmdline: cmdline.clone(),
             });
             next_procs.insert(
                 key,
@@ -404,6 +447,7 @@ impl Sampler {
                     ticks,
                     uid,
                     cgroup,
+                    cmdline,
                     extras,
                 },
             );
@@ -448,6 +492,16 @@ mod tests {
         let text = "rchar: 10\nwchar: 20\nsyscr: 1\nsyscw: 1\nread_bytes: 4096\nwrite_bytes: 8192\ncancelled_write_bytes: 0\n";
         assert_eq!(parse_io(text), Some((4096, 8192)));
         assert_eq!(parse_io("rchar: 1\n"), None);
+    }
+
+    #[test]
+    fn parses_cmdline() {
+        assert_eq!(
+            parse_cmdline(b"/usr/bin/foo\0--bar\0baz\0", false).as_deref(),
+            Some("/usr/bin/foo --bar baz")
+        );
+        assert_eq!(parse_cmdline(b"", false), None);
+        assert_eq!(parse_cmdline(b"abc\0", true).as_deref(), Some("abc…"));
     }
 
     #[test]

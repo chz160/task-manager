@@ -45,6 +45,8 @@ pub enum SortColumn {
     Disk,
     Gpu,
     Threads,
+    Status,
+    CommandLine,
 }
 
 impl SortColumn {
@@ -60,6 +62,23 @@ impl SortColumn {
             6 => Self::Disk,
             7 => Self::Gpu,
             8 => Self::Threads,
+            _ => return None,
+        })
+    }
+
+    /// Column order of the Details table in `main.slint`.
+    pub fn from_details_index(i: i32) -> Option<Self> {
+        Some(match i {
+            0 => Self::Name,
+            1 => Self::Pid,
+            2 => Self::Status,
+            3 => Self::User,
+            4 => Self::Cpu,
+            5 => Self::Memory,
+            6 => Self::Disk,
+            7 => Self::Gpu,
+            8 => Self::Threads,
+            9 => Self::CommandLine,
             _ => return None,
         })
     }
@@ -85,22 +104,34 @@ fn disk_bps(p: &ProcessInfo) -> u64 {
 }
 
 /// Sorts in place. Ties fall back to PID so the order is stable between refreshes.
-pub fn sort_processes(procs: &mut [ProcessInfo], users: &UserNames, sort: Sort) {
+pub fn sort_processes<T: AsRef<ProcessInfo>>(procs: &mut [T], users: &UserNames, sort: Sort) {
     match sort.column {
-        SortColumn::Name => procs.sort_by_cached_key(|p| (p.name.to_lowercase(), p.pid)),
-        SortColumn::User => procs.sort_by_cached_key(|p| (users.name(p.uid).to_lowercase(), p.pid)),
-        SortColumn::Pid => procs.sort_by_key(|p| p.pid),
-        SortColumn::Threads => procs.sort_by_key(|p| (p.threads, p.pid)),
-        SortColumn::Memory => procs.sort_by_key(|p| (p.pss_kib.unwrap_or(0), p.pid)),
-        SortColumn::Resident => procs.sort_by_key(|p| (p.rss_kib, p.pid)),
-        SortColumn::Disk => procs.sort_by_key(|p| (disk_bps(p), p.pid)),
+        SortColumn::Name => {
+            procs.sort_by_cached_key(|p| (p.as_ref().name.to_lowercase(), p.as_ref().pid))
+        }
+        SortColumn::User => procs
+            .sort_by_cached_key(|p| (users.name(p.as_ref().uid).to_lowercase(), p.as_ref().pid)),
+        SortColumn::Pid => procs.sort_by_key(|p| p.as_ref().pid),
+        SortColumn::Threads => procs.sort_by_key(|p| (p.as_ref().threads, p.as_ref().pid)),
+        SortColumn::Memory => {
+            procs.sort_by_key(|p| (p.as_ref().pss_kib.unwrap_or(0), p.as_ref().pid))
+        }
+        SortColumn::Resident => procs.sort_by_key(|p| (p.as_ref().rss_kib, p.as_ref().pid)),
+        SortColumn::Disk => procs.sort_by_key(|p| (disk_bps(p.as_ref()), p.as_ref().pid)),
         SortColumn::Gpu => procs.sort_by(|a, b| {
+            let (a, b) = (a.as_ref(), b.as_ref());
             a.gpu_percent
                 .unwrap_or(0.0)
                 .total_cmp(&b.gpu_percent.unwrap_or(0.0))
                 .then(a.pid.cmp(&b.pid))
         }),
+        SortColumn::Status => procs.sort_by_key(|p| (p.as_ref().state, p.as_ref().pid)),
+        SortColumn::CommandLine => procs.sort_by_cached_key(|p| {
+            let p = p.as_ref();
+            (p.cmdline.as_deref().unwrap_or("").to_lowercase(), p.pid)
+        }),
         SortColumn::Cpu => procs.sort_by(|a, b| {
+            let (a, b) = (a.as_ref(), b.as_ref());
             a.cpu_percent
                 .total_cmp(&b.cpu_percent)
                 .then(a.pid.cmp(&b.pid))
@@ -196,6 +227,126 @@ pub fn process_row(p: &ProcessInfo, users: &UserNames) -> [String; 9] {
     ]
 }
 
+/// One row of the Processes table: a single process, or all processes of one application
+/// owned by one user. `info` holds the sums (or, for a lone process, the process itself) and
+/// carries the lowest member PID, which keys the row.
+pub struct Group {
+    pub info: ProcessInfo,
+    pub pids: Vec<i32>,
+}
+
+impl AsRef<ProcessInfo> for Group {
+    fn as_ref(&self) -> &ProcessInfo {
+        &self.info
+    }
+}
+
+fn sum_opt<T: Copy + std::ops::Add<Output = T>>(a: Option<T>, b: Option<T>) -> Option<T> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a + b),
+        (x, None) | (None, x) => x,
+    }
+}
+
+/// With `grouped` off every process is its own group.
+pub fn group_processes(procs: &[ProcessInfo], grouped: bool) -> Vec<Group> {
+    let single = |p: &ProcessInfo| Group {
+        info: p.clone(),
+        pids: vec![p.pid],
+    };
+    if !grouped {
+        return procs.iter().map(single).collect();
+    }
+    let mut by_app: HashMap<(String, Option<u32>), Vec<&ProcessInfo>> = HashMap::new();
+    for p in procs {
+        by_app.entry((p.app_name(), p.uid)).or_default().push(p);
+    }
+    by_app
+        .into_iter()
+        .map(|((app, _), members)| {
+            let [only] = members[..] else {
+                return merge(app, &members);
+            };
+            single(only)
+        })
+        .collect()
+}
+
+fn merge(app: String, members: &[&ProcessInfo]) -> Group {
+    let first = members
+        .iter()
+        .min_by_key(|p| p.pid)
+        .expect("non-empty group");
+    let mut info = ProcessInfo {
+        name: app,
+        cmdline: None,
+        threads: 0,
+        rss_kib: 0,
+        cpu_percent: 0.0,
+        pss_kib: None,
+        disk_read_bps: None,
+        disk_write_bps: None,
+        gpu_percent: None,
+        gpu_mem_kib: None,
+        ..(*first).clone()
+    };
+    let mut pids = Vec::with_capacity(members.len());
+    for p in members {
+        pids.push(p.pid);
+        info.threads += p.threads;
+        info.rss_kib += p.rss_kib;
+        info.cpu_percent += p.cpu_percent;
+        info.pss_kib = sum_opt(info.pss_kib, p.pss_kib);
+        info.disk_read_bps = sum_opt(info.disk_read_bps, p.disk_read_bps);
+        info.disk_write_bps = sum_opt(info.disk_write_bps, p.disk_write_bps);
+        info.gpu_percent = sum_opt(info.gpu_percent, p.gpu_percent);
+        info.gpu_mem_kib = sum_opt(info.gpu_mem_kib, p.gpu_mem_kib);
+    }
+    info.gpu_percent = info.gpu_percent.map(|g| g.min(100.0));
+    pids.sort_unstable();
+    Group { info, pids }
+}
+
+/// "Idle" is the kernel's name for an idle kernel thread.
+pub fn status_text(state: char) -> &'static str {
+    match state {
+        'R' => "Running",
+        'S' => "Sleeping",
+        'D' => "Disk sleep",
+        'Z' => "Zombie",
+        'T' => "Stopped",
+        't' => "Tracing stop",
+        'X' | 'x' => "Dead",
+        'I' => "Idle",
+        _ => "Unknown",
+    }
+}
+
+pub fn group_row(g: &Group, users: &UserNames) -> [String; 9] {
+    let mut row = process_row(&g.info, users);
+    if g.pids.len() > 1 {
+        row[0] = format!("{} ({})", g.info.name, g.pids.len());
+        row[1] = String::new();
+    }
+    row
+}
+
+pub fn detail_row(p: &ProcessInfo, users: &UserNames) -> [String; 10] {
+    let r = process_row(p, users);
+    [
+        r[0].clone(),
+        r[1].clone(),
+        status_text(p.state).to_string(),
+        r[2].clone(),
+        r[3].clone(),
+        r[4].clone(),
+        r[6].clone(),
+        r[7].clone(),
+        r[8].clone(),
+        p.cmdline.as_deref().unwrap_or("").to_string(),
+    ]
+}
+
 pub fn user_row(u: &UserRow) -> [String; 4] {
     [
         u.name.clone(),
@@ -263,6 +414,7 @@ mod tests {
             gpu_percent: None,
             gpu_mem_kib: None,
             cgroup: None,
+            cmdline: None,
         }
     }
 
@@ -307,6 +459,69 @@ mod tests {
         assert_eq!(pids(SortColumn::Pid, true), [1, 2, 3]);
         assert_eq!(pids(SortColumn::Resident, false), [2, 3, 1]);
         assert_eq!(pids(SortColumn::User, true), [2, 3, 1]);
+    }
+
+    fn app_proc(pid: i32, name: &str, uid: u32, app: &str) -> ProcessInfo {
+        let mut p = proc(pid, name, uid, 1.0, 100);
+        p.cgroup = Some(format!("/user.slice/app.slice/app-gnome-{app}-1.scope").into());
+        p.threads = 2;
+        p
+    }
+
+    #[test]
+    fn groups_by_application_and_owner() {
+        let mut a = app_proc(10, "firefox-bin", 1000, "firefox");
+        let mut b = app_proc(12, "Web Content", 1000, "firefox");
+        a.pss_kib = Some(100);
+        b.pss_kib = Some(50);
+        a.gpu_percent = Some(70.0);
+        b.gpu_percent = Some(60.0);
+        a.disk_read_bps = Some(5);
+        let other_user = app_proc(14, "firefox-bin", 1001, "firefox");
+        let lone = proc(20, "bash", 1000, 0.5, 10);
+        let mut groups = group_processes(&[b, a, other_user, lone.clone()], true);
+        groups.sort_by_key(|g| g.info.pid);
+        assert_eq!(groups.len(), 3);
+        let ff = &groups[0];
+        assert_eq!(ff.pids, [10, 12]);
+        assert_eq!(ff.info.pid, 10);
+        assert_eq!(ff.info.name, "firefox");
+        assert_eq!(ff.info.rss_kib, 200);
+        assert_eq!(ff.info.threads, 4);
+        assert_eq!(ff.info.pss_kib, Some(150));
+        assert_eq!(ff.info.gpu_percent, Some(100.0), "capped");
+        assert_eq!(ff.info.disk_read_bps, Some(5));
+        assert_eq!(ff.info.disk_write_bps, None, "nobody could read it");
+        let row = group_row(ff, &users());
+        assert_eq!((row[0].as_str(), row[1].as_str()), ("firefox (2)", ""));
+        assert_eq!(groups[1].pids, [14], "same app, other owner");
+        assert_eq!(
+            group_row(&groups[2], &users())[0],
+            "bash",
+            "lone process keeps its name"
+        );
+        assert_eq!(group_processes(&[lone], true)[0].info.name, "bash");
+    }
+
+    #[test]
+    fn ungrouped_keeps_every_process() {
+        let ps = [app_proc(1, "a", 0, "x"), app_proc(2, "b", 0, "x")];
+        assert_eq!(group_processes(&ps, false).len(), 2);
+    }
+
+    #[test]
+    fn details_row_has_status_and_command_line() {
+        let mut p = proc(5, "sleep", 0, 0.0, 10);
+        p.cmdline = Some("sleep 60".into());
+        let r = detail_row(&p, &users());
+        assert_eq!(r[2], "Sleeping");
+        assert_eq!(r[3], "root");
+        assert_eq!(r[9], "sleep 60");
+        assert_eq!(
+            SortColumn::from_details_index(9),
+            Some(SortColumn::CommandLine)
+        );
+        assert_eq!(SortColumn::from_details_index(10), None);
     }
 
     #[test]
