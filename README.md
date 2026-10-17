@@ -15,7 +15,7 @@ Step 2 (Windows 7-style MVP): `tm-gui` is a [Slint](https://slint.dev) window wi
 - **Performance**: CPU and memory history graphs plus one graph per core.
 - **Users**: processes, CPU and memory totals per user.
 
-The refresh rate (0.5 s, 1 s, 4 s or paused) is in the bottom right.
+The refresh rate (1 s by default, or 2 s, 5 s or 10 s) is in the bottom right.
 
 ```
 cargo run --release -p tm-gui

@@ -14,11 +14,11 @@ slint::include_modules!();
 
 const HISTORY_LEN: usize = 60;
 /// Order matches the "Refresh" combo box in `main.slint`.
-const INTERVALS: [Option<Duration>; 4] = [
-    Some(Duration::from_millis(500)),
-    Some(Duration::from_secs(1)),
-    Some(Duration::from_secs(4)),
-    None,
+const INTERVALS: [Duration; 4] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(10),
 ];
 
 struct State {
@@ -139,7 +139,7 @@ fn set_interval(
     idx: usize,
 ) {
     timer.stop();
-    let Some(Some(every)) = INTERVALS.get(idx).copied() else {
+    let Some(every) = INTERVALS.get(idx).copied() else {
         return;
     };
     let (weak, st, m) = (ui.as_weak(), st.clone(), m.clone());
@@ -185,7 +185,7 @@ fn main() {
     let timer = Rc::new(Timer::default());
     std::thread::sleep(Duration::from_millis(200));
     refresh(&ui, &mut st.borrow_mut(), &m);
-    set_interval(&timer, &ui, &st, &m, 1);
+    set_interval(&timer, &ui, &st, &m, 0);
 
     let on_sort = |ascending: bool| {
         let (weak, st, m) = (ui.as_weak(), st.clone(), m.clone());
