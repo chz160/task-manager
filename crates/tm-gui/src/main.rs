@@ -34,15 +34,28 @@ const SERVICES_EVERY: Duration = Duration::from_secs(5);
 
 type ServicesReply = Result<Vec<ServiceInfo>, String>;
 
-#[derive(Default)]
 struct Services {
     list: Vec<ServiceInfo>,
     error: Option<String>,
+    /// Column and direction; starts at Name, A to Z.
     sort: (i32, bool),
     fetched_at: Option<Instant>,
     in_flight: bool,
     /// Where the fetch thread leaves its result for `on_services_ready` to pick up.
     mailbox: Arc<Mutex<Option<ServicesReply>>>,
+}
+
+impl Default for Services {
+    fn default() -> Self {
+        Self {
+            list: Vec::new(),
+            error: None,
+            sort: (0, true),
+            fetched_at: None,
+            in_flight: false,
+            mailbox: Arc::default(),
+        }
+    }
 }
 
 /// A process table as the user sees it: how it is sorted and which row is selected.
