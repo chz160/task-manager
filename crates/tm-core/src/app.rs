@@ -71,6 +71,13 @@ pub fn app_from_cgroup(path: &str) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
+/// The service unit (without `.service`) a cgroup path ends in, for matching processes
+/// to the Services table.
+pub fn service_unit_from_cgroup(path: &str) -> Option<String> {
+    let last = path.trim_end_matches('/').rsplit('/').next()?;
+    unescape(last).strip_suffix(".service").map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +127,21 @@ mod tests {
             app("/system.slice/getty@tty1.service").as_deref(),
             Some("getty")
         );
+    }
+
+    #[test]
+    fn service_units_keep_their_full_name() {
+        let u = service_unit_from_cgroup;
+        assert_eq!(u("/system.slice/cron.service").as_deref(), Some("cron"));
+        assert_eq!(
+            u("/system.slice/getty@tty1.service").as_deref(),
+            Some("getty@tty1")
+        );
+        assert_eq!(
+            u("/system.slice/ssh\\x2dagent.service").as_deref(),
+            Some("ssh-agent")
+        );
+        assert_eq!(u("/user.slice/session-3.scope"), None);
     }
 
     #[test]

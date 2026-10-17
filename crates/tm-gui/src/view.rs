@@ -1,7 +1,7 @@
 //! Presentation logic kept free of Slint types so it can be unit tested.
 
 use std::collections::{HashMap, VecDeque};
-use tm_core::ProcessInfo;
+use tm_core::{ProcessInfo, ServiceInfo, service_unit_from_cgroup};
 
 /// uid -> login name, from `/etc/passwd`. Unknown uids show as their number.
 #[derive(Default)]
@@ -347,6 +347,57 @@ pub fn detail_row(p: &ProcessInfo, users: &UserNames) -> [String; 10] {
     ]
 }
 
+/// One row of the Services table.
+#[derive(Debug, PartialEq)]
+pub struct ServiceRow {
+    pub name: String,
+    /// Lowest PID in the service's cgroup.
+    pub pid: Option<i32>,
+    pub description: String,
+    pub status: String,
+}
+
+pub fn service_rows(services: &[ServiceInfo], procs: &[ProcessInfo]) -> Vec<ServiceRow> {
+    let mut pid_of: HashMap<String, i32> = HashMap::new();
+    for p in procs {
+        if let Some(unit) = p.cgroup.as_deref().and_then(service_unit_from_cgroup) {
+            let e = pid_of.entry(unit).or_insert(p.pid);
+            *e = (*e).min(p.pid);
+        }
+    }
+    services
+        .iter()
+        .map(|s| ServiceRow {
+            pid: pid_of.get(&s.name).copied(),
+            name: s.name.clone(),
+            description: s.description.clone(),
+            status: s.status().to_string(),
+        })
+        .collect()
+}
+
+/// Column order of the Services table in `main.slint`: Name, PID, Description, Status.
+pub fn sort_services(rows: &mut [ServiceRow], column: i32, ascending: bool) {
+    match column {
+        1 => rows.sort_by(|a, b| a.pid.cmp(&b.pid).then_with(|| a.name.cmp(&b.name))),
+        2 => rows.sort_by_cached_key(|r| (r.description.to_lowercase(), r.name.clone())),
+        3 => rows.sort_by(|a, b| a.status.cmp(&b.status).then_with(|| a.name.cmp(&b.name))),
+        _ => rows.sort_by_cached_key(|r| r.name.to_lowercase()),
+    }
+    if !ascending {
+        rows.reverse();
+    }
+}
+
+pub fn service_cells(r: &ServiceRow) -> [String; 4] {
+    [
+        r.name.clone(),
+        r.pid.map_or(String::new(), |p| p.to_string()),
+        r.description.clone(),
+        r.status.clone(),
+    ]
+}
+
 pub fn user_row(u: &UserRow) -> [String; 4] {
     [
         u.name.clone(),
@@ -522,6 +573,35 @@ mod tests {
             Some(SortColumn::CommandLine)
         );
         assert_eq!(SortColumn::from_details_index(10), None);
+    }
+
+    #[test]
+    fn services_get_the_lowest_pid_of_their_cgroup() {
+        let mut a = proc(30, "cron", 0, 0.0, 1);
+        a.cgroup = Some("/system.slice/cron.service".into());
+        let mut b = proc(20, "cron", 0, 0.0, 1);
+        b.cgroup = Some("/system.slice/cron.service".into());
+        let svc = |n: &str, active: &str, sub: &str| ServiceInfo {
+            name: n.into(),
+            description: format!("{n} d"),
+            active_state: active.into(),
+            sub_state: sub.into(),
+        };
+        let mut rows = service_rows(
+            &[
+                svc("cron", "active", "running"),
+                svc("fstrim", "inactive", "dead"),
+            ],
+            &[a, b],
+        );
+        assert_eq!(rows[0].pid, Some(20));
+        assert_eq!(rows[1].pid, None);
+        assert_eq!(service_cells(&rows[0]), ["cron", "20", "cron d", "Running"]);
+        assert_eq!(service_cells(&rows[1])[1], "");
+        sort_services(&mut rows, 3, true);
+        assert_eq!(rows[0].name, "cron", "Running sorts before Stopped");
+        sort_services(&mut rows, 0, false);
+        assert_eq!(rows[0].name, "fstrim");
     }
 
     #[test]

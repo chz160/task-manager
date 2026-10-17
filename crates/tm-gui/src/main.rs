@@ -6,8 +6,9 @@ use rows::{KeyedRows, Row, RowCache};
 use slint::{Model, ModelRc, Timer, TimerMode, VecModel};
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::Duration;
-use tm_core::{Sampler, Snapshot};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tm_core::{Sampler, ServiceInfo, Snapshot};
 use view::{Group, History, Sort, SortColumn, UserNames};
 
 slint::include_modules!();
@@ -26,6 +27,23 @@ const TAB_PROCESSES: i32 = 0;
 const TAB_PERFORMANCE: i32 = 1;
 const TAB_USERS: i32 = 2;
 const TAB_DETAILS: i32 = 3;
+const TAB_SERVICES: i32 = 4;
+
+/// The service list comes over D-Bus, so it is fetched off the UI thread and at most this often.
+const SERVICES_EVERY: Duration = Duration::from_secs(5);
+
+type ServicesReply = Result<Vec<ServiceInfo>, String>;
+
+#[derive(Default)]
+struct Services {
+    list: Vec<ServiceInfo>,
+    error: Option<String>,
+    sort: (i32, bool),
+    fetched_at: Option<Instant>,
+    in_flight: bool,
+    /// Where the fetch thread leaves its result for `on_services_ready` to pick up.
+    mailbox: Arc<Mutex<Option<ServicesReply>>>,
+}
 
 /// A process table as the user sees it: how it is sorted and which row is selected.
 #[derive(Default)]
@@ -74,12 +92,15 @@ struct State {
     proc_cache: KeyedRows<9>,
     detail_cache: KeyedRows<10>,
     user_cache: RowCache<4>,
+    services: Services,
+    service_cache: RowCache<4>,
 }
 
 struct Models {
     procs: Rc<VecModel<Row>>,
     details: Rc<VecModel<Row>>,
     users: Rc<VecModel<Row>>,
+    services: Rc<VecModel<Row>>,
     cores: Rc<VecModel<GraphData>>,
 }
 
@@ -118,6 +139,7 @@ fn render(ui: &MainWindow, st: &mut State, m: &Models) {
             st.user_cache.sync(&m.users, rows);
         }
         TAB_PERFORMANCE => render_performance(ui, st, m, &snap, mem_pct),
+        TAB_SERVICES => render_services(ui, st, m, &snap),
         _ => {}
     }
 
@@ -155,6 +177,24 @@ fn render_details(ui: &MainWindow, st: &mut State, m: &Models, snap: &Snapshot) 
         .collect();
     st.detail_cache.sync(&m.details, rows);
     ui.set_detail_selected_row(st.tables[1].selected_index());
+}
+
+fn render_services(ui: &MainWindow, st: &mut State, m: &Models, snap: &Snapshot) {
+    let sv = &mut st.services;
+    if !sv.in_flight && sv.fetched_at.is_none_or(|t| t.elapsed() >= SERVICES_EVERY) {
+        sv.in_flight = true;
+        let (mailbox, weak) = (sv.mailbox.clone(), ui.as_weak());
+        std::thread::spawn(move || {
+            let reply = tm_core::list_services();
+            *mailbox.lock().unwrap_or_else(|e| e.into_inner()) = Some(reply);
+            let _ = weak.upgrade_in_event_loop(|ui| ui.invoke_services_ready());
+        });
+    }
+    let mut rows = view::service_rows(&sv.list, &snap.processes);
+    view::sort_services(&mut rows, sv.sort.0, sv.sort.1);
+    st.service_cache
+        .sync(&m.services, rows.iter().map(view::service_cells).collect());
+    ui.set_services_message(sv.error.clone().unwrap_or_default().into());
 }
 
 fn render_performance(ui: &MainWindow, st: &State, m: &Models, snap: &Snapshot, mem_pct: f64) {
@@ -239,15 +279,19 @@ fn main() {
         proc_cache: KeyedRows::new(),
         detail_cache: KeyedRows::new(),
         user_cache: RowCache::new(),
+        services: Services::default(),
+        service_cache: RowCache::new(),
     }));
     let m = Rc::new(Models {
         procs: Rc::new(VecModel::default()),
         details: Rc::new(VecModel::default()),
         users: Rc::new(VecModel::default()),
+        services: Rc::new(VecModel::default()),
         cores: Rc::new(VecModel::default()),
     });
     ui.set_process_rows(ModelRc::from(m.procs.clone()));
     ui.set_detail_rows(ModelRc::from(m.details.clone()));
+    ui.set_service_rows(ModelRc::from(m.services.clone()));
     ui.set_user_rows(ModelRc::from(m.users.clone()));
     ui.set_cores(ModelRc::from(m.cores.clone()));
 
@@ -284,6 +328,32 @@ fn main() {
             if let Some(t) = st.borrow_mut().tables.get_mut(table as usize) {
                 t.select(row);
             }
+        });
+    }
+    {
+        let (weak, st, m) = (ui.as_weak(), st.clone(), m.clone());
+        ui.on_services_ready(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let mut st = st.borrow_mut();
+            let sv = &mut st.services;
+            let reply = sv.mailbox.lock().unwrap_or_else(|e| e.into_inner()).take();
+            sv.in_flight = false;
+            sv.fetched_at = Some(Instant::now());
+            match reply {
+                Some(Ok(list)) => (sv.list, sv.error) = (list, None),
+                Some(Err(e)) => sv.error = Some(e),
+                None => {}
+            }
+            render(&ui, &mut st, &m);
+        });
+    }
+    {
+        let (weak, st, m) = (ui.as_weak(), st.clone(), m.clone());
+        ui.on_service_sorted(move |col, ascending| {
+            let Some(ui) = weak.upgrade() else { return };
+            let mut st = st.borrow_mut();
+            st.services.sort = (col, ascending);
+            render(&ui, &mut st, &m);
         });
     }
     {
