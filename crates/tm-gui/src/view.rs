@@ -39,7 +39,11 @@ pub enum SortColumn {
     Pid,
     User,
     Cpu,
+    /// Proportional set size.
     Memory,
+    Resident,
+    Disk,
+    Gpu,
     Threads,
 }
 
@@ -52,7 +56,10 @@ impl SortColumn {
             2 => Self::User,
             3 => Self::Cpu,
             4 => Self::Memory,
-            5 => Self::Threads,
+            5 => Self::Resident,
+            6 => Self::Disk,
+            7 => Self::Gpu,
+            8 => Self::Threads,
             _ => return None,
         })
     }
@@ -73,6 +80,10 @@ impl Default for Sort {
     }
 }
 
+fn disk_bps(p: &ProcessInfo) -> u64 {
+    p.disk_read_bps.unwrap_or(0) + p.disk_write_bps.unwrap_or(0)
+}
+
 /// Sorts in place. Ties fall back to PID so the order is stable between refreshes.
 pub fn sort_processes(procs: &mut [ProcessInfo], users: &UserNames, sort: Sort) {
     match sort.column {
@@ -80,7 +91,15 @@ pub fn sort_processes(procs: &mut [ProcessInfo], users: &UserNames, sort: Sort) 
         SortColumn::User => procs.sort_by_cached_key(|p| (users.name(p.uid).to_lowercase(), p.pid)),
         SortColumn::Pid => procs.sort_by_key(|p| p.pid),
         SortColumn::Threads => procs.sort_by_key(|p| (p.threads, p.pid)),
-        SortColumn::Memory => procs.sort_by_key(|p| (p.rss_kib, p.pid)),
+        SortColumn::Memory => procs.sort_by_key(|p| (p.pss_kib.unwrap_or(0), p.pid)),
+        SortColumn::Resident => procs.sort_by_key(|p| (p.rss_kib, p.pid)),
+        SortColumn::Disk => procs.sort_by_key(|p| (disk_bps(p), p.pid)),
+        SortColumn::Gpu => procs.sort_by(|a, b| {
+            a.gpu_percent
+                .unwrap_or(0.0)
+                .total_cmp(&b.gpu_percent.unwrap_or(0.0))
+                .then(a.pid.cmp(&b.pid))
+        }),
         SortColumn::Cpu => procs.sort_by(|a, b| {
             a.cpu_percent
                 .total_cmp(&b.cpu_percent)
@@ -141,13 +160,38 @@ pub fn format_percent(p: f64) -> String {
     format!("{p:.1}")
 }
 
-pub fn process_row(p: &ProcessInfo, users: &UserNames) -> [String; 6] {
+/// Shown where a value exists but this user may not read it.
+pub const UNKNOWN: &str = "—";
+
+/// "1.5 MB/s". Decimal units, as storage vendors and Windows show them.
+pub fn format_rate(bps: u64) -> String {
+    let b = bps as f64;
+    if b < 1000.0 {
+        format!("{bps} B/s")
+    } else if b < 1e6 {
+        format!("{:.1} KB/s", b / 1e3)
+    } else if b < 1e9 {
+        format!("{:.1} MB/s", b / 1e6)
+    } else {
+        format!("{:.1} GB/s", b / 1e9)
+    }
+}
+
+pub fn process_row(p: &ProcessInfo, users: &UserNames) -> [String; 9] {
+    let disk = match (p.disk_read_bps, p.disk_write_bps) {
+        (None, None) => UNKNOWN.to_string(),
+        _ => format_rate(disk_bps(p)),
+    };
     [
         p.name.clone(),
         p.pid.to_string(),
         users.name(p.uid),
         format_percent(p.cpu_percent),
+        p.pss_kib.map_or(UNKNOWN.to_string(), format_kib),
         format_kib(p.rss_kib),
+        disk,
+        p.gpu_percent
+            .map_or(UNKNOWN.to_string(), |g| format!("{g:.0}%")),
         p.threads.to_string(),
     ]
 }
@@ -213,6 +257,12 @@ mod tests {
             uid: Some(uid),
             rss_kib: rss,
             cpu_percent: cpu,
+            pss_kib: None,
+            disk_read_bps: None,
+            disk_write_bps: None,
+            gpu_percent: None,
+            gpu_mem_kib: None,
+            cgroup: None,
         }
     }
 
@@ -255,7 +305,7 @@ mod tests {
         assert_eq!(pids(SortColumn::Cpu, true), [2, 3, 1]);
         assert_eq!(pids(SortColumn::Name, true), [2, 3, 1], "case-insensitive");
         assert_eq!(pids(SortColumn::Pid, true), [1, 2, 3]);
-        assert_eq!(pids(SortColumn::Memory, false), [2, 3, 1]);
+        assert_eq!(pids(SortColumn::Resident, false), [2, 3, 1]);
         assert_eq!(pids(SortColumn::User, true), [2, 3, 1]);
     }
 
@@ -295,6 +345,56 @@ mod tests {
         assert_eq!(format_kib(999), "999 K");
         assert_eq!(format_kib(1_234_567), "1,234,567 K");
         assert_eq!(format_percent(0.04), "0.0");
+        assert_eq!(format_rate(999), "999 B/s");
+        assert_eq!(format_rate(1_500), "1.5 KB/s");
+        assert_eq!(format_rate(2_500_000), "2.5 MB/s");
+        assert_eq!(format_rate(3_000_000_000), "3.0 GB/s");
+    }
+
+    #[test]
+    fn unreadable_values_show_a_dash_and_readable_ones_do_not() {
+        let u = users();
+        let mut p = proc(1, "a", 0, 0.0, 100);
+        let row = process_row(&p, &u);
+        assert_eq!(
+            (row[4].as_str(), row[6].as_str(), row[7].as_str()),
+            (UNKNOWN, UNKNOWN, UNKNOWN)
+        );
+        p.pss_kib = Some(1234);
+        p.disk_read_bps = Some(1_000);
+        p.disk_write_bps = Some(500);
+        p.gpu_percent = Some(12.4);
+        let row = process_row(&p, &u);
+        assert_eq!(row[4], "1,234 K");
+        assert_eq!(row[6], "1.5 KB/s");
+        assert_eq!(row[7], "12%");
+    }
+
+    #[test]
+    fn sorts_by_the_new_columns() {
+        let u = users();
+        let mut a = proc(1, "a", 0, 0.0, 10);
+        let mut b = proc(2, "b", 0, 0.0, 10);
+        a.pss_kib = Some(5);
+        b.pss_kib = Some(50);
+        a.disk_write_bps = Some(900);
+        b.disk_read_bps = Some(100);
+        a.gpu_percent = Some(80.0);
+        let order = |col| {
+            let mut v = vec![a.clone(), b.clone()];
+            sort_processes(
+                &mut v,
+                &u,
+                Sort {
+                    column: col,
+                    ascending: false,
+                },
+            );
+            v.iter().map(|p| p.pid).collect::<Vec<_>>()
+        };
+        assert_eq!(order(SortColumn::Memory), [2, 1]);
+        assert_eq!(order(SortColumn::Disk), [1, 2]);
+        assert_eq!(order(SortColumn::Gpu), [1, 2]);
     }
 
     #[test]
