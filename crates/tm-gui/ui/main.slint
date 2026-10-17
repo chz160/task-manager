@@ -54,6 +54,8 @@ export component MainWindow inherits Window {
 
     in property <[[StandardListViewItem]]> process-rows;
     in property <[[StandardListViewItem]]> detail-rows;
+    in property <[[StandardListViewItem]]> service-rows;
+    in property <string> services-message;
     in property <[[StandardListViewItem]]> user-rows;
     in-out property <int> selected-row: -1;
     in-out property <int> detail-selected-row: -1;
@@ -76,6 +78,8 @@ export component MainWindow inherits Window {
     callback sort-descending(int, int);
     callback row-selected(int, int);
     callback tab-selected(int);
+    callback services-ready();
+    callback service-sorted(int, bool);
     callback group-toggled(bool);
     callback end-process-clicked(int);
     callback end-process-confirmed();
@@ -205,6 +209,27 @@ export component MainWindow inherits Window {
                             enabled: root.detail-selected-row >= 0;
                             clicked => { root.end-process-clicked(1); }
                         }
+                    }
+                }
+            }
+            Tab {
+                title: "Services";
+                VerticalLayout {
+                    spacing: 8px;
+                    if root.services-message != "" : Text {
+                        text: root.services-message;
+                        wrap: word-wrap;
+                    }
+                    StandardTableView {
+                        columns: [
+                            { title: "Name", min-width: 160px },
+                            { title: "PID", min-width: 70px },
+                            { title: "Description", min-width: 300px, horizontal-stretch: 1 },
+                            { title: "Status", min-width: 90px },
+                        ];
+                        rows: root.service-rows;
+                        sort-ascending(c) => { root.service-sorted(c, true); }
+                        sort-descending(c) => { root.service-sorted(c, false); }
                     }
                 }
             }
