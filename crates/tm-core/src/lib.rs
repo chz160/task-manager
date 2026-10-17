@@ -216,8 +216,13 @@ fn refresh_extras(
             || (rss_kib.abs_diff(rss_then) as f64) > rss_then as f64 * PSS_RSS_DRIFT
     });
     if stale {
+        // Back-date only the first read; doing it on every re-read would shorten the period.
+        let jitter = if e.pss_at.is_none() {
+            Duration::from_secs(u64::from(pid.unsigned_abs()) % PSS_MAX_AGE.as_secs())
+        } else {
+            Duration::ZERO
+        };
         e.pss_kib = read_pss_kib(pid);
-        let jitter = Duration::from_secs(u64::from(pid.unsigned_abs()) % PSS_MAX_AGE.as_secs());
         e.pss_at = Some((now.checked_sub(jitter).unwrap_or(now), rss_kib));
     }
 
