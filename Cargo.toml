@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/tm-core", "crates/tm-cli"]
+members = ["crates/tm-core", "crates/tm-cli", "crates/tm-gui"]
 
 [profile.release]
 lto = true
