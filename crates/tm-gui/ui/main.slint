@@ -47,7 +47,7 @@ component LabeledGraph inherits VerticalLayout {
 
 export component MainWindow inherits Window {
     title: "Task Manager";
-    preferred-width: 760px;
+    preferred-width: 980px;
     preferred-height: 560px;
     min-width: 520px;
     min-height: 380px;
@@ -91,8 +91,11 @@ export component MainWindow inherits Window {
                             { title: "PID", min-width: 70px },
                             { title: "User Name", min-width: 120px },
                             { title: "CPU %", min-width: 90px },
-                            { title: "Memory (RSS)", min-width: 130px },
-                            { title: "Threads", min-width: 90px },
+                            { title: "Memory (PSS)", min-width: 110px },
+                            { title: "Memory (RSS)", min-width: 110px },
+                            { title: "Disk", min-width: 90px },
+                            { title: "GPU", min-width: 60px },
+                            { title: "Threads", min-width: 70px },
                         ];
                         rows: root.process-rows;
                         current-row <=> root.selected-row;
