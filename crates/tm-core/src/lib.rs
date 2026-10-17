@@ -1,12 +1,33 @@
 //! Stateful `/proc` sampler. CPU percentages need two samples, so the
 //! sampler keeps the previous counters between calls to [`Sampler::sample`].
 
+mod app;
+mod gpu;
+
+pub use app::app_from_cgroup;
+
+use gpu::GpuCounters;
 use procfs::process::Stat;
 use procfs::{CpuTime, Current, CurrentSI, FromRead, KernelStats, Meminfo};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// How often the expensive per-process readings (PSS, disk I/O, GPU) are refreshed.
+/// They cost far more than `/proc/<pid>/stat`, and change slowly enough for this.
+pub const DEFAULT_EXTRAS_INTERVAL: Duration = Duration::from_secs(5);
+/// `smaps_rollup` makes the kernel walk every mapping, so it is by far the costliest reading
+/// (about half the sampler's whole CPU use if done for every process every few seconds).
+/// A process's PSS is re-read when its RSS, which comes free with `stat`, has moved by more
+/// than [`PSS_RSS_DRIFT`], or when the reading is this old. The first read of each process is
+/// aged by its PID so the age-based refreshes spread over the period instead of bunching up.
+const PSS_MAX_AGE: Duration = Duration::from_secs(60);
+const PSS_RSS_DRIFT: f64 = 0.05;
+/// A process known to have no GPU fds is looked at again after this many extras rounds.
+const GPU_RECHECK_ROUNDS: u64 = 24;
 
 #[derive(Debug, Clone)]
 pub struct MemInfo {
@@ -33,6 +54,28 @@ pub struct ProcessInfo {
     pub rss_kib: u64,
     /// Share of total system CPU (0..=100), Windows style. 0 on the first sample.
     pub cpu_percent: f64,
+    /// Proportional set size: shared pages split between the processes mapping them.
+    /// `None` when `/proc/<pid>/smaps_rollup` is unreadable (other users' processes).
+    pub pss_kib: Option<u64>,
+    /// Bytes per second that reached or left the storage device. `None` when unreadable.
+    pub disk_read_bps: Option<u64>,
+    pub disk_write_bps: Option<u64>,
+    /// Busiest GPU engine, 0..=100, and GPU memory in use. `None` when the process is not
+    /// ours to inspect or the driver does not expose DRM fdinfo.
+    pub gpu_percent: Option<f64>,
+    pub gpu_mem_kib: Option<u64>,
+    /// Unified-hierarchy cgroup path, e.g. `/user.slice/.../app-gnome-firefox-1.scope`.
+    pub cgroup: Option<Arc<str>>,
+}
+
+impl ProcessInfo {
+    /// The application this process belongs to: its cgroup's app or service name, else its own name.
+    pub fn app_name(&self) -> String {
+        self.cgroup
+            .as_deref()
+            .and_then(app_from_cgroup)
+            .unwrap_or_else(|| self.name.clone())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -75,11 +118,157 @@ fn percent(prev: CoreTicks, cur: CoreTicks) -> f64 {
     cur.busy.saturating_sub(prev.busy) as f64 / dt as f64 * 100.0
 }
 
-#[derive(Clone, Copy)]
+/// Slow-changing readings, cached between extras rounds.
+#[derive(Clone, Default)]
+struct Extras {
+    pss_kib: Option<u64>,
+    /// When PSS was read (back-dated by a per-PID jitter) and the RSS at that time.
+    pss_at: Option<(Instant, u64)>,
+    /// Cumulative `read_bytes`, `write_bytes` at the last round.
+    io: Option<(u64, u64)>,
+    /// CPU ticks (utime + stime) when `io` was read. A process that has not run since cannot
+    /// have done any I/O, so its file is not read again.
+    io_ticks: u64,
+    disk_read_bps: Option<u64>,
+    disk_write_bps: Option<u64>,
+    gpu_prev: Option<GpuCounters>,
+    gpu_percent: Option<f64>,
+    gpu_mem_kib: Option<u64>,
+    /// Round at which the fd table was last scanned for GPU clients.
+    gpu_checked: Option<u64>,
+}
+
 struct ProcPrev {
     ticks: u64,
-    /// A process never changes owner, so look it up once instead of every sample.
+    /// A process never changes owner or (in practice) cgroup, so look them up once.
     uid: Option<u32>,
+    cgroup: Option<Arc<str>>,
+    extras: Extras,
+}
+
+/// One open, one read, one close; `fs::read_to_string` adds a size probe and a second read
+/// to find EOF, which is a lot of extra syscalls over a thousand processes. The files read
+/// this way are all well under 4 KiB; a full buffer means something unexpected, so give up.
+fn read_small(path: &str) -> Option<String> {
+    let mut buf = [0u8; 4096];
+    let n = File::open(path).ok()?.read(&mut buf).ok()?;
+    if n == buf.len() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&buf[..n]).into_owned())
+}
+
+fn read_pss_kib(pid: i32) -> Option<u64> {
+    let text = read_small(&format!("/proc/{pid}/smaps_rollup"))?;
+    parse_pss_kib(&text)
+}
+
+fn parse_pss_kib(text: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|l| l.strip_prefix("Pss:"))?
+        .trim()
+        .strip_suffix("kB")?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn read_io(pid: i32) -> Option<(u64, u64)> {
+    parse_io(&read_small(&format!("/proc/{pid}/io"))?)
+}
+
+/// Storage-level bytes, not `rchar`/`wchar`, which also count page-cache hits.
+fn parse_io(text: &str) -> Option<(u64, u64)> {
+    let field = |name: &str| -> Option<u64> {
+        text.lines()
+            .find_map(|l| l.strip_prefix(name))?
+            .trim()
+            .parse()
+            .ok()
+    };
+    Some((field("read_bytes:")?, field("write_bytes:")?))
+}
+
+fn read_cgroup(pid: i32) -> Option<Arc<str>> {
+    let text = read_small(&format!("/proc/{pid}/cgroup"))?;
+    parse_cgroup(&text).map(Arc::from)
+}
+
+/// cgroup v2 has a single `0::<path>` line; on a v1 or hybrid system there is none and
+/// processes are grouped by name instead.
+fn parse_cgroup(text: &str) -> Option<String> {
+    text.lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .map(|p| p.trim_end().to_string())
+}
+
+fn refresh_extras(
+    pid: i32,
+    rss_kib: u64,
+    ticks: u64,
+    round: u64,
+    now: Instant,
+    elapsed: Option<f64>,
+    e: &mut Extras,
+) {
+    let stale = e.pss_at.is_none_or(|(t, rss_then)| {
+        now - t >= PSS_MAX_AGE
+            || (rss_kib.abs_diff(rss_then) as f64) > rss_then as f64 * PSS_RSS_DRIFT
+    });
+    if stale {
+        // Back-date only the first read; doing it on every re-read would shorten the period.
+        let jitter = if e.pss_at.is_none() {
+            Duration::from_secs(u64::from(pid.unsigned_abs()) % PSS_MAX_AGE.as_secs())
+        } else {
+            Duration::ZERO
+        };
+        e.pss_kib = read_pss_kib(pid);
+        e.pss_at = Some((now.checked_sub(jitter).unwrap_or(now), rss_kib));
+    }
+
+    if e.io.is_none() || ticks != e.io_ticks {
+        let io = read_io(pid);
+        (e.disk_read_bps, e.disk_write_bps) = match (e.io, io, elapsed) {
+            (Some(p), Some(c), Some(dt)) if dt > 0.0 => (
+                Some((c.0.saturating_sub(p.0) as f64 / dt) as u64),
+                Some((c.1.saturating_sub(p.1) as f64 / dt) as u64),
+            ),
+            (_, Some(_), _) => (Some(0), Some(0)),
+            _ => (None, None),
+        };
+        e.io = io;
+        e.io_ticks = ticks;
+    } else {
+        (e.disk_read_bps, e.disk_write_bps) = (Some(0), Some(0));
+    }
+
+    let due = match e.gpu_checked {
+        None => true,
+        Some(_) => e.gpu_prev.is_some() || (round + pid as u64).is_multiple_of(GPU_RECHECK_ROUNDS),
+    };
+    if due {
+        e.gpu_checked = Some(round);
+        match gpu::read_counters(pid) {
+            Ok(Some(cur)) => {
+                e.gpu_percent = Some(match (&e.gpu_prev, elapsed) {
+                    (Some(prev), Some(dt)) => gpu::utilisation(prev, &cur, dt),
+                    _ => 0.0,
+                });
+                e.gpu_mem_kib = Some(cur.mem_kib);
+                e.gpu_prev = Some(cur);
+            }
+            Ok(None) => {
+                e.gpu_prev = None;
+                e.gpu_percent = Some(0.0);
+                e.gpu_mem_kib = Some(0);
+            }
+            Err(_) => {
+                e.gpu_prev = None;
+                e.gpu_percent = None;
+                e.gpu_mem_kib = None;
+            }
+        }
+    }
 }
 
 /// Reads and parses `/proc/<pid>/stat` with one open, one read and one close.
@@ -112,11 +301,19 @@ pub struct Sampler {
     prev_cores: Vec<CoreTicks>,
     /// (pid, starttime) -> previous counters. Start time guards against PID reuse.
     prev_procs: HashMap<(i32, u64), ProcPrev>,
+    extras_interval: Option<Duration>,
+    last_extras: Option<Instant>,
+    extras_round: u64,
 }
 
 impl Sampler {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Sets how often PSS, disk I/O and GPU readings are refreshed (default 5 s).
+    pub fn set_extras_interval(&mut self, every: Duration) {
+        self.extras_interval = Some(every);
     }
 
     pub fn sample(&mut self) -> procfs::ProcResult<Snapshot> {
@@ -137,6 +334,17 @@ impl Sampler {
             .prev_total
             .map_or(0.0, |p| total.total.saturating_sub(p.total) as f64);
 
+        // Others' processes only expose these files to root, so don't even try.
+        let my_uid = fs::metadata("/proc/self").ok().map(|m| m.uid());
+        let now = Instant::now();
+        let every = self.extras_interval.unwrap_or(DEFAULT_EXTRAS_INTERVAL);
+        let extras_due = self.last_extras.is_none_or(|t| now - t >= every);
+        let elapsed = self.last_extras.map(|t| (now - t).as_secs_f64());
+        if extras_due {
+            self.extras_round += 1;
+        }
+        let round = self.extras_round;
+
         let page_kib = procfs::page_size() / 1024;
         let mut next_procs = HashMap::with_capacity(self.prev_procs.len());
         let mut processes = Vec::new();
@@ -145,16 +353,35 @@ impl Sampler {
             let Some(stat) = read_stat(pid) else { continue };
             let ticks = stat.utime + stat.stime;
             let key = (stat.pid, stat.starttime);
-            let prev = self.prev_procs.get(&key);
-            let cpu = match (prev, denom > 0.0) {
+            let prev = self.prev_procs.remove(&key);
+            let cpu = match (&prev, denom > 0.0) {
                 (Some(prev), true) => ticks.saturating_sub(prev.ticks) as f64 / denom * 100.0,
                 _ => 0.0,
             };
-            let uid = match prev {
-                Some(prev) => prev.uid,
-                None => fs::metadata(format!("/proc/{pid}")).ok().map(|m| m.uid()),
+            let (uid, cgroup, mut extras, fresh) = match prev {
+                Some(p) => (p.uid, p.cgroup, p.extras, false),
+                None => (
+                    fs::metadata(format!("/proc/{pid}")).ok().map(|m| m.uid()),
+                    read_cgroup(pid),
+                    Extras::default(),
+                    true,
+                ),
             };
-            next_procs.insert(key, ProcPrev { ticks, uid });
+            // Kernel threads have no memory to inspect.
+            let rss_kib = stat.rss * page_kib;
+            let inspectable = stat.rss > 0 && uid.is_some() && (my_uid == Some(0) || uid == my_uid);
+            if inspectable && (extras_due || fresh) {
+                // A process that appeared since the last round has no baseline to diff against.
+                refresh_extras(
+                    pid,
+                    rss_kib,
+                    ticks,
+                    round,
+                    now,
+                    if fresh { None } else { elapsed },
+                    &mut extras,
+                );
+            }
             processes.push(ProcessInfo {
                 pid: stat.pid,
                 ppid: stat.ppid,
@@ -162,9 +389,24 @@ impl Sampler {
                 state: stat.state,
                 threads: stat.num_threads,
                 uid,
-                rss_kib: stat.rss * page_kib,
+                rss_kib,
                 cpu_percent: cpu,
+                pss_kib: extras.pss_kib,
+                disk_read_bps: extras.disk_read_bps,
+                disk_write_bps: extras.disk_write_bps,
+                gpu_percent: extras.gpu_percent,
+                gpu_mem_kib: extras.gpu_mem_kib,
+                cgroup: cgroup.clone(),
             });
+            next_procs.insert(
+                key,
+                ProcPrev {
+                    ticks,
+                    uid,
+                    cgroup,
+                    extras,
+                },
+            );
         }
 
         let mi = Meminfo::current()?;
@@ -175,6 +417,9 @@ impl Sampler {
             swap_free_kib: mi.swap_free / 1024,
         };
 
+        if extras_due {
+            self.last_extras = Some(now);
+        }
         self.prev_total = Some(total);
         self.prev_cores = cores;
         self.prev_procs = next_procs;
@@ -184,5 +429,33 @@ impl Sampler {
             mem,
             processes,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_pss() {
+        let text = "55a-55b ---p 0 [rollup]\nRss:                1000 kB\nPss:                 512 kB\nPss_Anon: 5 kB\n";
+        assert_eq!(parse_pss_kib(text), Some(512));
+        assert_eq!(parse_pss_kib("Rss: 1 kB\n"), None);
+    }
+
+    #[test]
+    fn parses_io_storage_bytes() {
+        let text = "rchar: 10\nwchar: 20\nsyscr: 1\nsyscw: 1\nread_bytes: 4096\nwrite_bytes: 8192\ncancelled_write_bytes: 0\n";
+        assert_eq!(parse_io(text), Some((4096, 8192)));
+        assert_eq!(parse_io("rchar: 1\n"), None);
+    }
+
+    #[test]
+    fn parses_unified_cgroup() {
+        assert_eq!(
+            parse_cgroup("0::/user.slice/a.scope\n").as_deref(),
+            Some("/user.slice/a.scope")
+        );
+        assert_eq!(parse_cgroup("12:cpu:/x\n"), None);
     }
 }

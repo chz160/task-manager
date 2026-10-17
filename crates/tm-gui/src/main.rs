@@ -32,7 +32,7 @@ struct State {
     cpu: History,
     mem: History,
     cores: Vec<History>,
-    proc_cache: KeyedRows<6>,
+    proc_cache: KeyedRows<9>,
     user_cache: RowCache<4>,
 }
 
