@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tm_core::{Sampler, ServiceInfo, Snapshot};
+use tm_core::{Sampler, ServiceInfo, Snapshot, StartupDirs, StartupEntry};
 use view::{Group, History, Sort, SortColumn, UserNames};
 
 slint::include_modules!();
@@ -25,9 +25,10 @@ const INTERVALS: [Duration; 4] = [
 /// Order of the tabs in `main.slint`. Only the visible one is rendered each refresh.
 const TAB_PROCESSES: i32 = 0;
 const TAB_PERFORMANCE: i32 = 1;
-const TAB_USERS: i32 = 2;
-const TAB_DETAILS: i32 = 3;
-const TAB_SERVICES: i32 = 4;
+const TAB_STARTUP: i32 = 2;
+const TAB_USERS: i32 = 3;
+const TAB_DETAILS: i32 = 4;
+const TAB_SERVICES: i32 = 5;
 
 /// The service list comes over D-Bus, so it is fetched off the UI thread and at most this often.
 const SERVICES_EVERY: Duration = Duration::from_secs(5);
@@ -87,6 +88,13 @@ impl TableState {
     }
 }
 
+struct Startup {
+    dirs: StartupDirs,
+    list: Vec<StartupEntry>,
+    /// File name of the selected entry; survives the list being re-read.
+    selected: Option<String>,
+}
+
 struct State {
     sampler: Sampler,
     users: UserNames,
@@ -107,6 +115,8 @@ struct State {
     user_cache: RowCache<4>,
     services: Services,
     service_cache: RowCache<4>,
+    startup: Startup,
+    startup_cache: RowCache<4>,
 }
 
 struct Models {
@@ -114,6 +124,7 @@ struct Models {
     details: Rc<VecModel<Row>>,
     users: Rc<VecModel<Row>>,
     services: Rc<VecModel<Row>>,
+    startup: Rc<VecModel<Row>>,
     cores: Rc<VecModel<GraphData>>,
 }
 
@@ -153,6 +164,7 @@ fn render(ui: &MainWindow, st: &mut State, m: &Models) {
         }
         TAB_PERFORMANCE => render_performance(ui, st, m, &snap, mem_pct),
         TAB_SERVICES => render_services(ui, st, m, &snap),
+        TAB_STARTUP => render_startup(ui, st, m),
         _ => {}
     }
 
@@ -190,6 +202,25 @@ fn render_details(ui: &MainWindow, st: &mut State, m: &Models, snap: &Snapshot) 
         .collect();
     st.detail_cache.sync(&m.details, rows);
     ui.set_detail_selected_row(st.tables[1].selected_index());
+}
+
+fn render_startup(ui: &MainWindow, st: &mut State, m: &Models) {
+    let su = &mut st.startup;
+    su.list = tm_core::list_startup(&su.dirs);
+    st.startup_cache.sync(
+        &m.startup,
+        su.list.iter().map(view::startup_cells).collect(),
+    );
+    let idx = su
+        .selected
+        .as_ref()
+        .and_then(|id| su.list.iter().position(|e| &e.id == id));
+    if idx.is_none() {
+        su.selected = None;
+    }
+    ui.set_startup_selected_row(idx.map_or(-1, |i| i as i32));
+    let enabled = idx.is_some_and(|i| su.list[i].enabled);
+    ui.set_startup_action(if enabled { "Disable" } else { "Enable" }.into());
 }
 
 fn render_services(ui: &MainWindow, st: &mut State, m: &Models, snap: &Snapshot) {
@@ -294,16 +325,24 @@ fn main() {
         user_cache: RowCache::new(),
         services: Services::default(),
         service_cache: RowCache::new(),
+        startup: Startup {
+            dirs: StartupDirs::from_env(),
+            list: Vec::new(),
+            selected: None,
+        },
+        startup_cache: RowCache::new(),
     }));
     let m = Rc::new(Models {
         procs: Rc::new(VecModel::default()),
         details: Rc::new(VecModel::default()),
         users: Rc::new(VecModel::default()),
         services: Rc::new(VecModel::default()),
+        startup: Rc::new(VecModel::default()),
         cores: Rc::new(VecModel::default()),
     });
     ui.set_process_rows(ModelRc::from(m.procs.clone()));
     ui.set_detail_rows(ModelRc::from(m.details.clone()));
+    ui.set_startup_rows(ModelRc::from(m.startup.clone()));
     ui.set_service_rows(ModelRc::from(m.services.clone()));
     ui.set_user_rows(ModelRc::from(m.users.clone()));
     ui.set_cores(ModelRc::from(m.cores.clone()));
@@ -356,6 +395,44 @@ fn main() {
                 Some(Ok(list)) => (sv.list, sv.error) = (list, None),
                 Some(Err(e)) => sv.error = Some(e),
                 None => {}
+            }
+            render(&ui, &mut st, &m);
+        });
+    }
+    {
+        let (weak, st) = (ui.as_weak(), st.clone());
+        ui.on_startup_row_selected(move |row| {
+            let Some(ui) = weak.upgrade() else { return };
+            let mut st = st.borrow_mut();
+            let su = &mut st.startup;
+            su.selected = usize::try_from(row)
+                .ok()
+                .and_then(|i| su.list.get(i))
+                .map(|e| e.id.clone());
+            let enabled = su
+                .selected
+                .as_ref()
+                .and_then(|id| su.list.iter().find(|e| &e.id == id))
+                .is_some_and(|e| e.enabled);
+            ui.set_startup_action(if enabled { "Disable" } else { "Enable" }.into());
+        });
+    }
+    {
+        let (weak, st, m) = (ui.as_weak(), st.clone(), m.clone());
+        ui.on_startup_toggled(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let mut st = st.borrow_mut();
+            let su = &st.startup;
+            let Some(entry) = su
+                .selected
+                .as_ref()
+                .and_then(|id| su.list.iter().find(|e| &e.id == id))
+            else {
+                return;
+            };
+            if let Err(e) = tm_core::set_startup_enabled(&su.dirs, &entry.id, !entry.enabled) {
+                ui.set_message(format!("Could not change \"{}\": {e}", entry.name).into());
+                ui.set_confirming(false);
             }
             render(&ui, &mut st, &m);
         });

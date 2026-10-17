@@ -1,7 +1,7 @@
 //! Presentation logic kept free of Slint types so it can be unit tested.
 
 use std::collections::{HashMap, VecDeque};
-use tm_core::{ProcessInfo, ServiceInfo, service_unit_from_cgroup};
+use tm_core::{ProcessInfo, ServiceInfo, StartupEntry, service_unit_from_cgroup};
 
 /// uid -> login name, from `/etc/passwd`. Unknown uids show as their number.
 #[derive(Default)]
@@ -398,6 +398,15 @@ pub fn service_cells(r: &ServiceRow) -> [String; 4] {
     ]
 }
 
+pub fn startup_cells(e: &StartupEntry) -> [String; 4] {
+    [
+        e.name.clone(),
+        e.exec.clone(),
+        if e.enabled { "Enabled" } else { "Disabled" }.to_string(),
+        if e.user { "User" } else { "System" }.to_string(),
+    ]
+}
+
 pub fn user_row(u: &UserRow) -> [String; 4] {
     [
         u.name.clone(),
@@ -602,6 +611,18 @@ mod tests {
         assert_eq!(rows[0].name, "cron", "Running sorts before Stopped");
         sort_services(&mut rows, 0, false);
         assert_eq!(rows[0].name, "fstrim");
+    }
+
+    #[test]
+    fn startup_cells_show_status_and_origin() {
+        let e = StartupEntry {
+            id: "a.desktop".into(),
+            name: "A".into(),
+            exec: "a --x".into(),
+            enabled: false,
+            user: true,
+        };
+        assert_eq!(startup_cells(&e), ["A", "a --x", "Disabled", "User"]);
     }
 
     #[test]
