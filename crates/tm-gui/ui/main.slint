@@ -54,6 +54,9 @@ export component MainWindow inherits Window {
 
     in property <[[StandardListViewItem]]> process-rows;
     in property <[[StandardListViewItem]]> detail-rows;
+    in property <[[StandardListViewItem]]> startup-rows;
+    in-out property <int> startup-selected-row: -1;
+    in property <string> startup-action: "Disable";
     in property <[[StandardListViewItem]]> service-rows;
     in property <string> services-message;
     in property <[[StandardListViewItem]]> user-rows;
@@ -78,6 +81,8 @@ export component MainWindow inherits Window {
     callback sort-descending(int, int);
     callback row-selected(int, int);
     callback tab-selected(int);
+    callback startup-row-selected(int);
+    callback startup-toggled();
     callback services-ready();
     callback service-sorted(int, bool);
     callback group-toggled(bool);
@@ -162,6 +167,31 @@ export component MainWindow inherits Window {
                     Text {
                         text: root.stats-text;
                         wrap: word-wrap;
+                    }
+                }
+            }
+            Tab {
+                title: "Startup";
+                VerticalLayout {
+                    spacing: 8px;
+                    StandardTableView {
+                        columns: [
+                            { title: "Name", min-width: 160px },
+                            { title: "Command", min-width: 280px, horizontal-stretch: 1 },
+                            { title: "Status", min-width: 90px },
+                            { title: "Location", min-width: 80px },
+                        ];
+                        rows: root.startup-rows;
+                        current-row <=> root.startup-selected-row;
+                        current-row-changed(r) => { root.startup-row-selected(r); }
+                    }
+                    HorizontalLayout {
+                        alignment: end;
+                        Button {
+                            text: root.startup-action;
+                            enabled: root.startup-selected-row >= 0;
+                            clicked => { root.startup-toggled(); }
+                        }
                     }
                 }
             }
