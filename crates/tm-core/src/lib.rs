@@ -11,8 +11,7 @@ pub use services::{ServiceInfo, list_services};
 pub use startup::{StartupDirs, StartupEntry, list_startup, set_startup_enabled};
 
 use gpu::GpuCounters;
-use procfs::process::Stat;
-use procfs::{CpuTime, Current, CurrentSI, FromRead, KernelStats, Meminfo};
+use procfs::{CpuTime, Current, CurrentSI, KernelStats, Meminfo};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Read;
@@ -316,21 +315,75 @@ fn refresh_extras(
     }
 }
 
+/// The fields of `/proc/<pid>/stat` the sampler uses.
+#[derive(Debug, PartialEq)]
+struct StatLine {
+    pid: i32,
+    ppid: i32,
+    comm: String,
+    state: char,
+    utime: u64,
+    stime: u64,
+    num_threads: i64,
+    starttime: u64,
+    /// In pages.
+    rss: u64,
+}
+
+/// Parses only what is needed from a stat line; `procfs::process::Stat` parses all fifty-odd
+/// fields, which costs about a fifth of the sampling time with a thousand processes.
+fn parse_stat(raw: &[u8]) -> Option<StatLine> {
+    // comm may contain spaces and parentheses, so it ends at the last ')'.
+    let open = raw.iter().position(|b| *b == b'(')?;
+    let close = raw.iter().rposition(|b| *b == b')')?;
+    let pid = std::str::from_utf8(raw.get(..open)?)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let comm = String::from_utf8_lossy(raw.get(open + 1..close)?).into_owned();
+    let rest = std::str::from_utf8(raw.get(close + 1..)?).ok()?;
+    // Fields after comm, numbered from the state (field 3 in proc(5)).
+    let mut f = rest.split_ascii_whitespace();
+    let state = f.next()?.chars().next()?;
+    let ppid = f.next()?.parse().ok()?;
+    let mut f = f.skip(9); // pgrp .. cmajflt (fields 5..13)
+    let utime = f.next()?.parse().ok()?; // 14
+    let stime = f.next()?.parse().ok()?; // 15
+    let mut f = f.skip(4); // cutime .. nice (16..19)
+    let num_threads = f.next()?.parse().ok()?; // 20
+    let mut f = f.skip(1); // itrealvalue (21)
+    let starttime = f.next()?.parse().ok()?; // 22
+    let mut f = f.skip(1); // vsize (23)
+    let rss = f.next()?.parse::<i64>().ok()?.max(0) as u64; // 24
+    Some(StatLine {
+        pid,
+        ppid,
+        comm,
+        state,
+        utime,
+        stime,
+        num_threads,
+        starttime,
+        rss,
+    })
+}
+
 /// Reads and parses `/proc/<pid>/stat` with one open, one read and one close.
 /// `procfs::process::Process` costs about three times as many syscalls per process,
 /// which dominates the sampling cost with a thousand processes.
-fn read_stat(pid: i32) -> Option<Stat> {
+fn read_stat(pid: i32, path: &mut String, buf: &mut [u8; 4096]) -> Option<StatLine> {
+    use std::fmt::Write;
     // The stat line is far below 4 KiB (comm is at most 16 bytes); a full buffer means
-    // something unexpected, so skip it.
-    let mut buf = [0u8; 4096];
-    let n = File::open(format!("/proc/{pid}/stat"))
-        .ok()?
-        .read(&mut buf)
-        .ok()?;
+    // something unexpected, so skip it. The caller owns the buffer so that it is zeroed once
+    // per sweep, not once per process.
+    path.clear();
+    let _ = write!(path, "/proc/{pid}/stat");
+    let n = File::open(&*path).ok()?.read(&mut buf[..]).ok()?;
     if n == buf.len() {
         return None;
     }
-    Stat::from_read(&buf[..n]).ok()
+    parse_stat(&buf[..n])
 }
 
 fn list_pids() -> procfs::ProcResult<Vec<i32>> {
@@ -392,10 +445,14 @@ impl Sampler {
 
         let page_kib = procfs::page_size() / 1024;
         let mut next_procs = HashMap::with_capacity(self.prev_procs.len());
-        let mut processes = Vec::new();
+        let mut processes = Vec::with_capacity(self.prev_procs.len());
+        let mut path = String::with_capacity(32);
+        let mut buf = [0u8; 4096];
         for pid in list_pids()? {
             // Processes can exit between listing and reading; skip them.
-            let Some(stat) = read_stat(pid) else { continue };
+            let Some(stat) = read_stat(pid, &mut path, &mut buf) else {
+                continue;
+            };
             let ticks = stat.utime + stat.stime;
             let key = (stat.pid, stat.starttime);
             let prev = self.prev_procs.remove(&key);
@@ -483,6 +540,27 @@ impl Sampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_stat_line() {
+        let line = b"1234 (my (odd) app) S 1 1234 1234 0 -1 4194560 100 0 0 0 11 22 0 0 20 0 7 0 5555 1000000 321 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 17 3 0 0 0 0 0\n";
+        assert_eq!(
+            parse_stat(line),
+            Some(StatLine {
+                pid: 1234,
+                ppid: 1,
+                comm: "my (odd) app".into(),
+                state: 'S',
+                utime: 11,
+                stime: 22,
+                num_threads: 7,
+                starttime: 5555,
+                rss: 321,
+            })
+        );
+        assert_eq!(parse_stat(b"1 (x) S 1 2"), None);
+        assert_eq!(parse_stat(b""), None);
+    }
 
     #[test]
     fn parses_pss() {
