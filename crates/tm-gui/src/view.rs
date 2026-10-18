@@ -1,7 +1,7 @@
 //! Presentation logic kept free of Slint types so it can be unit tested.
 
 use std::collections::{HashMap, VecDeque};
-use tm_core::{ProcessInfo, ServiceInfo, StartupEntry, service_unit_from_cgroup};
+use tm_core::{NvidiaGpu, ProcessInfo, ServiceInfo, StartupEntry, service_unit_from_cgroup};
 
 /// uid -> login name, from `/etc/passwd`. Unknown uids show as their number.
 #[derive(Default)]
@@ -336,6 +336,32 @@ pub fn status_text(state: char) -> &'static str {
         'I' => "Idle",
         _ => "Unknown",
     }
+}
+
+/// Shown on the Performance tab when an NVIDIA kernel driver is loaded but NVML is not usable.
+pub const NVIDIA_HINT: &str = "NVIDIA GPU details need the driver's NVML library (libnvidia-ml.so.1, from the NVIDIA driver / nvidia-utils package).";
+
+/// Graph title for one NVIDIA GPU: name, load, memory and temperature, whichever are known.
+pub fn gpu_label(index: usize, count: usize, g: &NvidiaGpu) -> String {
+    let mut s = if count > 1 {
+        format!("GPU {index}  {}", g.name)
+    } else {
+        format!("GPU  {}", g.name)
+    };
+    if let Some(u) = g.util_percent {
+        s += &format!("  {u}%");
+    }
+    if let (Some(used), Some(total)) = (g.mem_used_kib, g.mem_total_kib) {
+        s += &format!(
+            "  {:.1} / {:.1} GiB",
+            used as f64 / 1048576.0,
+            total as f64 / 1048576.0
+        );
+    }
+    if let Some(t) = g.temp_c {
+        s += &format!("  {t} °C");
+    }
+    s
 }
 
 pub fn group_row(g: &Group, users: &UserNames) -> [String; 10] {
@@ -711,6 +737,23 @@ mod tests {
         assert_eq!(row[6], "1.5 KB/s");
         assert_eq!(row[7], "2.5 MB/s");
         assert_eq!(row[8], "12%");
+    }
+
+    #[test]
+    fn gpu_label_shows_what_is_known() {
+        let mut g = NvidiaGpu {
+            name: "RTX".into(),
+            util_percent: Some(42),
+            mem_used_kib: Some(2 * 1048576),
+            mem_total_kib: Some(8 * 1048576),
+            temp_c: Some(61),
+        };
+        assert_eq!(gpu_label(0, 1, &g), "GPU  RTX  42%  2.0 / 8.0 GiB  61 °C");
+        assert_eq!(gpu_label(1, 2, &g), "GPU 1  RTX  42%  2.0 / 8.0 GiB  61 °C");
+        g.util_percent = None;
+        g.mem_used_kib = None;
+        g.temp_c = None;
+        assert_eq!(gpu_label(0, 1, &g), "GPU  RTX");
     }
 
     #[test]

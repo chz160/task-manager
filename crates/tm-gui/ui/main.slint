@@ -70,6 +70,8 @@ export component MainWindow inherits Window {
     in property <string> mem-text;
     in property <string> mem-commands;
     in property <[GraphData]> cores;
+    in property <[GraphData]> gpus;
+    in property <string> gpu-hint;
     in property <string> stats-text;
     in property <string> status-text;
 
@@ -165,6 +167,16 @@ export component MainWindow inherits Window {
                             commands: core.commands;
                             line: #e0c040;
                         }
+                    }
+                    for gpu in root.gpus: LabeledGraph {
+                        title: gpu.label;
+                        commands: gpu.commands;
+                        line: #76b900;
+                        vertical-stretch: 1;
+                    }
+                    if root.gpu-hint != "": Text {
+                        text: root.gpu-hint;
+                        wrap: word-wrap;
                     }
                     Text {
                         text: root.stats-text;

@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tm_core::{Sampler, ServiceInfo, Snapshot, StartupDirs, StartupEntry};
+use tm_core::{Nvidia, Sampler, ServiceInfo, Snapshot, StartupDirs, StartupEntry};
 use view::{Group, History, Sort, SortColumn, UserNames};
 
 slint::include_modules!();
@@ -110,6 +110,7 @@ struct State {
     cpu: History,
     mem: History,
     cores: Vec<History>,
+    gpus: Vec<History>,
     proc_cache: KeyedRows<10>,
     detail_cache: KeyedRows<11>,
     user_cache: RowCache<4>,
@@ -126,6 +127,7 @@ struct Models {
     services: Rc<VecModel<Row>>,
     startup: Rc<VecModel<Row>>,
     cores: Rc<VecModel<GraphData>>,
+    gpus: Rc<VecModel<GraphData>>,
 }
 
 /// Takes a sample and records the history; drawing is `render`'s job.
@@ -142,6 +144,13 @@ fn refresh(ui: &MainWindow, st: &mut State, m: &Models) {
         .resize_with(snap.per_core_percent.len(), || History::new(HISTORY_LEN));
     for (h, v) in st.cores.iter_mut().zip(&snap.per_core_percent) {
         h.push(*v);
+    }
+    if let Nvidia::Gpus(gpus) = &snap.nvidia {
+        st.gpus
+            .resize_with(gpus.len(), || History::new(HISTORY_LEN));
+        for (h, g) in st.gpus.iter_mut().zip(gpus) {
+            h.push(f64::from(g.util_percent.unwrap_or(0)));
+        }
     }
     st.last = Some(snap);
     render(ui, st, m);
@@ -272,6 +281,34 @@ fn render_performance(ui: &MainWindow, st: &State, m: &Models, snap: &Snapshot, 
         m.cores.set_vec(graphs);
     }
 
+    let graphs: Vec<GraphData> = match &snap.nvidia {
+        Nvidia::Gpus(gpus) => gpus
+            .iter()
+            .zip(&st.gpus)
+            .enumerate()
+            .map(|(i, (g, h))| GraphData {
+                label: view::gpu_label(i, gpus.len(), g).into(),
+                commands: h.area_path().into(),
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    if graphs.len() == m.gpus.row_count() {
+        for (i, g) in graphs.into_iter().enumerate() {
+            m.gpus.set_row_data(i, g);
+        }
+    } else {
+        m.gpus.set_vec(graphs);
+    }
+    ui.set_gpu_hint(
+        if snap.nvidia == Nvidia::NoNvml {
+            view::NVIDIA_HINT
+        } else {
+            ""
+        }
+        .into(),
+    );
+
     let threads: i64 = snap.processes.iter().map(|p| p.threads).sum();
     ui.set_stats_text(
         format!(
@@ -320,6 +357,7 @@ fn main() {
         cpu: History::new(HISTORY_LEN),
         mem: History::new(HISTORY_LEN),
         cores: Vec::new(),
+        gpus: Vec::new(),
         proc_cache: KeyedRows::new(),
         detail_cache: KeyedRows::new(),
         user_cache: RowCache::new(),
@@ -339,6 +377,7 @@ fn main() {
         services: Rc::new(VecModel::default()),
         startup: Rc::new(VecModel::default()),
         cores: Rc::new(VecModel::default()),
+        gpus: Rc::new(VecModel::default()),
     });
     ui.set_process_rows(ModelRc::from(m.procs.clone()));
     ui.set_detail_rows(ModelRc::from(m.details.clone()));
@@ -346,6 +385,7 @@ fn main() {
     ui.set_service_rows(ModelRc::from(m.services.clone()));
     ui.set_user_rows(ModelRc::from(m.users.clone()));
     ui.set_cores(ModelRc::from(m.cores.clone()));
+    ui.set_gpus(ModelRc::from(m.gpus.clone()));
 
     let timer = Rc::new(Timer::default());
     std::thread::sleep(Duration::from_millis(200));

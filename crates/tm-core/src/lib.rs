@@ -4,6 +4,7 @@
 mod app;
 mod gpu;
 mod net;
+mod nvml;
 mod services;
 mod startup;
 
@@ -13,6 +14,8 @@ pub use startup::{StartupDirs, StartupEntry, list_startup, set_startup_enabled};
 
 use gpu::GpuCounters;
 use net::NetTracker;
+use nvml::Nvml;
+pub use nvml::{NvidiaGpu, ProcUse};
 use procfs::{CpuTime, Current, CurrentSI, KernelStats, Meminfo};
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -95,6 +98,17 @@ impl ProcessInfo {
     }
 }
 
+/// State of NVIDIA GPU monitoring, which relies on the driver's NVML library.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum Nvidia {
+    /// No NVIDIA driver on this machine.
+    #[default]
+    Absent,
+    /// The kernel driver is loaded but `libnvidia-ml.so.1` could not be used.
+    NoNvml,
+    Gpus(Vec<NvidiaGpu>),
+}
+
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     /// Overall CPU busy percentage. 0 on the first sample.
@@ -102,6 +116,7 @@ pub struct Snapshot {
     pub per_core_percent: Vec<f64>,
     pub mem: MemInfo,
     pub processes: Vec<ProcessInfo>,
+    pub nvidia: Nvidia,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -410,6 +425,9 @@ pub struct Sampler {
     last_extras: Option<Instant>,
     extras_round: u64,
     net: NetTracker,
+    /// `None` until the first sample tries to load NVML; `Some((None, driver))` when it is not usable, with whether an NVIDIA kernel driver is loaded.
+    nvml: Option<(Option<Nvml>, bool)>,
+    nvml_procs: HashMap<i32, ProcUse>,
 }
 
 impl Sampler {
@@ -542,6 +560,30 @@ impl Sampler {
             }
         }
 
+        let (nvml, driver) = self
+            .nvml
+            .get_or_insert_with(|| (Nvml::load(), nvml::driver_present()));
+        let nvidia = match nvml {
+            Some(n) => {
+                if extras_due {
+                    self.nvml_procs = n.processes();
+                }
+                for p in &mut processes {
+                    if let Some(u) = self.nvml_procs.get(&p.pid) {
+                        p.gpu_percent = Some(
+                            p.gpu_percent
+                                .unwrap_or(0.0)
+                                .max(f64::from(u.util_percent.unwrap_or(0))),
+                        );
+                        p.gpu_mem_kib = Some(p.gpu_mem_kib.unwrap_or(0) + u.mem_kib.unwrap_or(0));
+                    }
+                }
+                Nvidia::Gpus(n.gpus())
+            }
+            None if *driver => Nvidia::NoNvml,
+            None => Nvidia::Absent,
+        };
+
         let mi = Meminfo::current()?;
         let mem = MemInfo {
             total_kib: mi.mem_total / 1024,
@@ -561,6 +603,7 @@ impl Sampler {
             per_core_percent,
             mem,
             processes,
+            nvidia,
         })
     }
 }
