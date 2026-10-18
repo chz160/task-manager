@@ -7,7 +7,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -23,7 +23,7 @@ jobs:
   gui:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install Xvfb and runtime libraries
@@ -33,7 +33,7 @@ jobs:
       - run: cargo build --release -p tm-gui
       - name: CPU budget (<2% of a core at 1 s refresh, ~1000 processes)
         run: scripts/perf-check.sh target/release/tm-gui
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tm-gui-linux-x86_64
           path: target/release/tm-gui
