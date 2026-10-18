@@ -2,19 +2,33 @@
 //! every touched row costs a repaint, and most of a thousand processes do not change.
 
 use slint::{Model, ModelRc, SharedString, StandardListViewItem, VecModel};
+use std::rc::Rc;
 
 pub type Row = ModelRc<StandardListViewItem>;
 
-pub fn row<const N: usize>(cells: &[String; N]) -> Row {
-    let items: Vec<StandardListViewItem> = cells
-        .iter()
-        .map(|c| {
-            let mut i = StandardListViewItem::default();
-            i.text = SharedString::from(c.as_str());
-            i
-        })
-        .collect();
-    ModelRc::new(VecModel::from(items))
+/// The cells of one row; kept so that a changed value rewrites its own cell and the other
+/// cells of the row are not laid out and painted again.
+type Cells = Rc<VecModel<StandardListViewItem>>;
+
+fn item(text: &str) -> StandardListViewItem {
+    let mut i = StandardListViewItem::default();
+    i.text = SharedString::from(text);
+    i
+}
+
+fn new_cells<const N: usize>(cells: &[String; N]) -> Cells {
+    Rc::new(VecModel::from(
+        cells.iter().map(|c| item(c)).collect::<Vec<_>>(),
+    ))
+}
+
+/// Rewrites the cells of `model` that differ between `old` and `new`.
+fn update_cells<const N: usize>(model: &Cells, old: &[String; N], new: &[String; N]) {
+    for (c, (o, n)) in old.iter().zip(new).enumerate() {
+        if o != n {
+            model.set_row_data(c, item(n));
+        }
+    }
 }
 
 /// Marks which entries of `seq` belong to a longest strictly increasing subsequence.
@@ -45,6 +59,7 @@ fn lis_members(seq: &[usize]) -> Vec<bool> {
 pub struct KeyedRows<const N: usize> {
     keys: Vec<i32>,
     cells: Vec<[String; N]>,
+    models: Vec<Cells>,
 }
 
 impl<const N: usize> KeyedRows<N> {
@@ -52,6 +67,7 @@ impl<const N: usize> KeyedRows<N> {
         Self {
             keys: Vec::new(),
             cells: Vec::new(),
+            models: Vec::new(),
         }
     }
 
@@ -73,47 +89,58 @@ impl<const N: usize> KeyedRows<N> {
             if !stay[i] {
                 self.keys.remove(i);
                 self.cells.remove(i);
+                self.models.remove(i);
                 model.remove(i);
             }
         }
         for (i, (key, cells)) in rows.into_iter().enumerate() {
             if self.keys.get(i) == Some(&key) {
                 if self.cells[i] != cells {
-                    model.set_row_data(i, row(&cells));
+                    update_cells(&self.models[i], &self.cells[i], &cells);
                     self.cells[i] = cells;
                 }
             } else {
-                model.insert(i, row(&cells));
+                let inner = new_cells(&cells);
+                model.insert(i, ModelRc::from(inner.clone()));
                 self.keys.insert(i, key);
                 self.cells.insert(i, cells);
+                self.models.insert(i, inner);
             }
         }
     }
 }
 
 /// Positional variant for small tables with no stable key: rewrites only rows whose text changed.
-pub struct RowCache<const N: usize>(Vec<[String; N]>);
+pub struct RowCache<const N: usize> {
+    cells: Vec<[String; N]>,
+    models: Vec<Cells>,
+}
 
 impl<const N: usize> RowCache<N> {
     pub fn new() -> Self {
-        Self(Vec::new())
+        Self {
+            cells: Vec::new(),
+            models: Vec::new(),
+        }
     }
 
     pub fn sync(&mut self, model: &VecModel<Row>, rows: Vec<[String; N]>) {
         for (i, cells) in rows.iter().enumerate() {
-            if self.0.get(i) == Some(cells) {
-                continue;
-            }
-            if i < model.row_count() {
-                model.set_row_data(i, row(cells));
-            } else {
-                model.push(row(cells));
+            match self.cells.get(i) {
+                Some(old) if old == cells => {}
+                Some(old) => update_cells(&self.models[i], old, cells),
+                None => {
+                    let inner = new_cells(cells);
+                    model.push(ModelRc::from(inner.clone()));
+                    self.models.push(inner);
+                }
             }
         }
         while model.row_count() > rows.len() {
             model.remove(model.row_count() - 1);
         }
-        self.0 = rows;
+        self.models.truncate(rows.len());
+        self.cells = rows;
     }
 }
 
