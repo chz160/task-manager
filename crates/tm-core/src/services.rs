@@ -1,4 +1,8 @@
 //! System services from systemd's D-Bus API. Reading the unit list needs no privileges.
+//! Starting and stopping goes through `pkexec systemctl`, because zbus cannot set the
+//! D-Bus "allow interactive authorization" flag that makes polkit ask for a password.
+
+use std::process::Command;
 
 use zbus::blocking::Connection;
 use zbus::zvariant::OwnedObjectPath;
@@ -13,6 +17,14 @@ pub struct ServiceInfo {
 }
 
 impl ServiceInfo {
+    /// Whether Stop and Restart apply: the service is running or on its way up.
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self.active_state.as_str(),
+            "active" | "activating" | "reloading"
+        )
+    }
+
     /// Windows-style status word for the Services table.
     pub fn status(&self) -> &str {
         match (self.active_state.as_str(), self.sub_state.as_str()) {
@@ -25,6 +37,72 @@ impl ServiceInfo {
             ("inactive", _) => "Stopped",
             _ => "Unknown",
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceAction {
+    Start,
+    Stop,
+    Restart,
+}
+
+impl ServiceAction {
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+        }
+    }
+}
+
+const SYSTEMCTL_BINARIES: [&str; 2] = ["/usr/bin/systemctl", "/bin/systemctl"];
+
+/// Arguments after `systemctl`. `--` keeps a unit name from ever being read as an option.
+fn systemctl_args(name: &str, action: ServiceAction) -> Vec<String> {
+    vec![
+        "--no-ask-password".into(),
+        action.verb().into(),
+        "--".into(),
+        format!("{name}.service"),
+    ]
+}
+
+/// Starts, stops or restarts a system service, blocking until systemd finishes the job.
+/// Run it off the UI thread: polkit's password dialog is open for as long as it takes.
+pub fn control_service(name: &str, action: ServiceAction) -> Result<(), String> {
+    let systemctl = SYSTEMCTL_BINARIES
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .ok_or("Could not find systemctl.")?;
+    // SAFETY: geteuid(2) has no preconditions.
+    let mut cmd = if unsafe { libc::geteuid() } == 0 {
+        Command::new(systemctl)
+    } else {
+        let mut c = Command::new("pkexec");
+        c.arg(systemctl);
+        c
+    };
+    let out = cmd
+        .args(systemctl_args(name, action))
+        .output()
+        .map_err(|e| format!("Could not ask for permission (is polkit installed?): {e}"))?;
+    match out.status.code() {
+        Some(0) => Ok(()),
+        // pkexec: 126 = dialog dismissed, 127 = not authorized.
+        Some(126) => Err(format!(
+            "Permission was not granted, so \"{name}\" was not changed."
+        )),
+        Some(127) => Err(format!(
+            "You are not authorized to {} \"{name}\".",
+            action.verb()
+        )),
+        _ => Err(format!(
+            "Could not {} \"{name}\": {}",
+            action.verb(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
     }
 }
 
@@ -117,6 +195,29 @@ mod tests {
         let names: Vec<_> = s.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["cron", "fstrim"]);
         assert_eq!(s[0].description, "cron.service description");
+    }
+
+    #[test]
+    fn systemctl_arguments() {
+        assert_eq!(
+            systemctl_args("cups", ServiceAction::Restart),
+            ["--no-ask-password", "restart", "--", "cups.service"]
+        );
+        assert_eq!(systemctl_args("-x", ServiceAction::Stop)[3], "-x.service");
+    }
+
+    #[test]
+    fn only_up_services_can_be_stopped() {
+        let active = |a: &str| ServiceInfo {
+            name: "x".into(),
+            description: String::new(),
+            active_state: a.into(),
+            sub_state: String::new(),
+        };
+        assert!(active("active").is_active());
+        assert!(active("activating").is_active());
+        assert!(!active("inactive").is_active());
+        assert!(!active("failed").is_active());
     }
 
     #[test]

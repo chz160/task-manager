@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tm_core::{Nvidia, Sampler, ServiceInfo, Snapshot, StartupDirs, StartupEntry};
+use tm_core::{Nvidia, Sampler, ServiceAction, ServiceInfo, Snapshot, StartupDirs, StartupEntry};
 use view::{Group, History, Sort, SortColumn, UserNames};
 
 slint::include_modules!();
@@ -42,6 +42,14 @@ struct Services {
     sort: (i32, bool),
     fetched_at: Option<Instant>,
     in_flight: bool,
+    /// Name of the selected service; survives the list being re-read and re-sorted.
+    selected: Option<String>,
+    /// Service names in the order the table currently shows them.
+    order: Vec<String>,
+    /// A start/stop/restart is waiting on authorisation or on systemd.
+    busy: bool,
+    /// Where the action thread leaves its outcome for `on_service_action_done`.
+    action_mailbox: Arc<Mutex<Option<Result<(), String>>>>,
     /// Where the fetch thread leaves its result for `on_services_ready` to pick up.
     mailbox: Arc<Mutex<Option<ServicesReply>>>,
 }
@@ -54,6 +62,10 @@ impl Default for Services {
             sort: (0, true),
             fetched_at: None,
             in_flight: false,
+            selected: None,
+            order: Vec::new(),
+            busy: false,
+            action_mailbox: Arc::default(),
             mailbox: Arc::default(),
         }
     }
@@ -248,6 +260,23 @@ fn render_services(ui: &MainWindow, st: &mut State, m: &Models, snap: &Snapshot)
     st.service_cache
         .sync(&m.services, rows.iter().map(view::service_cells).collect());
     ui.set_services_message(sv.error.clone().unwrap_or_default().into());
+    sv.order = rows.into_iter().map(|r| r.name).collect();
+    let idx = sv
+        .selected
+        .as_ref()
+        .and_then(|n| sv.order.iter().position(|o| o == n));
+    if idx.is_none() {
+        sv.selected = None;
+    }
+    ui.set_service_selected_row(idx.map_or(-1, |i| i as i32));
+    let active = sv
+        .selected
+        .as_ref()
+        .and_then(|n| sv.list.iter().find(|s| &s.name == n))
+        .map(ServiceInfo::is_active);
+    ui.set_service_can_start(active == Some(false));
+    ui.set_service_can_stop(active == Some(true));
+    ui.set_service_busy(sv.busy);
 }
 
 fn render_performance(ui: &MainWindow, st: &State, m: &Models, snap: &Snapshot, mem_pct: f64) {
@@ -472,6 +501,65 @@ fn main() {
             };
             if let Err(e) = tm_core::set_startup_enabled(&su.dirs, &entry.id, !entry.enabled) {
                 ui.set_message(format!("Could not change \"{}\": {e}", entry.name).into());
+                ui.set_confirming(false);
+            }
+            render(&ui, &mut st, &m);
+        });
+    }
+    {
+        let (weak, st, m) = (ui.as_weak(), st.clone(), m.clone());
+        ui.on_service_row_selected(move |row| {
+            let Some(ui) = weak.upgrade() else { return };
+            let mut st = st.borrow_mut();
+            let sv = &mut st.services;
+            sv.selected = usize::try_from(row)
+                .ok()
+                .and_then(|i| sv.order.get(i).cloned());
+            render(&ui, &mut st, &m);
+        });
+    }
+    {
+        let (weak, st, m) = (ui.as_weak(), st.clone(), m.clone());
+        ui.on_service_action(move |which| {
+            let Some(ui) = weak.upgrade() else { return };
+            let mut st = st.borrow_mut();
+            let sv = &mut st.services;
+            let Some(name) = sv.selected.clone().filter(|_| !sv.busy) else {
+                return;
+            };
+            let action = match which {
+                0 => ServiceAction::Start,
+                1 => ServiceAction::Stop,
+                _ => ServiceAction::Restart,
+            };
+            sv.busy = true;
+            let mailbox = sv.action_mailbox.clone();
+            render(&ui, &mut st, &m);
+            // pkexec blocks on the authentication dialog, so keep it off the UI thread.
+            let weak = ui.as_weak();
+            std::thread::spawn(move || {
+                let result = tm_core::control_service(&name, action);
+                *mailbox.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+                let _ = weak.upgrade_in_event_loop(|ui| ui.invoke_service_action_done());
+            });
+        });
+    }
+    {
+        let (weak, st, m) = (ui.as_weak(), st.clone(), m.clone());
+        ui.on_service_action_done(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let mut st = st.borrow_mut();
+            let sv = &mut st.services;
+            sv.busy = false;
+            // Re-read the list now so the row shows the new status.
+            sv.fetched_at = None;
+            let result = sv
+                .action_mailbox
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(Err(msg)) = result {
+                ui.set_message(msg.into());
                 ui.set_confirming(false);
             }
             render(&ui, &mut st, &m);

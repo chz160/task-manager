@@ -9,7 +9,7 @@ mod services;
 mod startup;
 
 pub use app::{app_from_cgroup, service_unit_from_cgroup};
-pub use services::{ServiceInfo, list_services};
+pub use services::{ServiceAction, ServiceInfo, control_service, list_services};
 pub use startup::{StartupDirs, StartupEntry, list_startup, set_startup_enabled};
 
 use gpu::GpuCounters;
