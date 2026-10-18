@@ -43,6 +43,7 @@ pub enum SortColumn {
     Memory,
     Resident,
     Disk,
+    Network,
     Gpu,
     Threads,
     Status,
@@ -60,8 +61,9 @@ impl SortColumn {
             4 => Self::Memory,
             5 => Self::Resident,
             6 => Self::Disk,
-            7 => Self::Gpu,
-            8 => Self::Threads,
+            7 => Self::Network,
+            8 => Self::Gpu,
+            9 => Self::Threads,
             _ => return None,
         })
     }
@@ -76,9 +78,10 @@ impl SortColumn {
             4 => Self::Cpu,
             5 => Self::Memory,
             6 => Self::Disk,
-            7 => Self::Gpu,
-            8 => Self::Threads,
-            9 => Self::CommandLine,
+            7 => Self::Network,
+            8 => Self::Gpu,
+            9 => Self::Threads,
+            10 => Self::CommandLine,
             _ => return None,
         })
     }
@@ -97,6 +100,10 @@ impl Default for Sort {
             ascending: false,
         }
     }
+}
+
+fn net_bps(p: &ProcessInfo) -> u64 {
+    p.net_recv_bps.unwrap_or(0) + p.net_send_bps.unwrap_or(0)
 }
 
 fn disk_bps(p: &ProcessInfo) -> u64 {
@@ -118,6 +125,7 @@ pub fn sort_processes<T: AsRef<ProcessInfo>>(procs: &mut [T], users: &UserNames,
         }
         SortColumn::Resident => procs.sort_by_key(|p| (p.as_ref().rss_kib, p.as_ref().pid)),
         SortColumn::Disk => procs.sort_by_key(|p| (disk_bps(p.as_ref()), p.as_ref().pid)),
+        SortColumn::Network => procs.sort_by_key(|p| (net_bps(p.as_ref()), p.as_ref().pid)),
         SortColumn::Gpu => procs.sort_by(|a, b| {
             let (a, b) = (a.as_ref(), b.as_ref());
             a.gpu_percent
@@ -208,7 +216,7 @@ pub fn format_rate(bps: u64) -> String {
     }
 }
 
-pub fn process_row(p: &ProcessInfo, users: &UserNames) -> [String; 9] {
+pub fn process_row(p: &ProcessInfo, users: &UserNames) -> [String; 10] {
     let disk = match (p.disk_read_bps, p.disk_write_bps) {
         (None, None) => UNKNOWN.to_string(),
         _ => format_rate(disk_bps(p)),
@@ -221,6 +229,10 @@ pub fn process_row(p: &ProcessInfo, users: &UserNames) -> [String; 9] {
         p.pss_kib.map_or(UNKNOWN.to_string(), format_kib),
         format_kib(p.rss_kib),
         disk,
+        match (p.net_recv_bps, p.net_send_bps) {
+            (None, None) => UNKNOWN.to_string(),
+            _ => format_rate(net_bps(p)),
+        },
         p.gpu_percent
             .map_or(UNKNOWN.to_string(), |g| format!("{g:.0}%")),
         p.threads.to_string(),
@@ -288,6 +300,8 @@ fn merge(app: String, members: &[&ProcessInfo]) -> Group {
         disk_write_bps: None,
         gpu_percent: None,
         gpu_mem_kib: None,
+        net_recv_bps: None,
+        net_send_bps: None,
         ..(*first).clone()
     };
     let mut pids = Vec::with_capacity(members.len());
@@ -301,6 +315,8 @@ fn merge(app: String, members: &[&ProcessInfo]) -> Group {
         info.disk_write_bps = sum_opt(info.disk_write_bps, p.disk_write_bps);
         info.gpu_percent = sum_opt(info.gpu_percent, p.gpu_percent);
         info.gpu_mem_kib = sum_opt(info.gpu_mem_kib, p.gpu_mem_kib);
+        info.net_recv_bps = sum_opt(info.net_recv_bps, p.net_recv_bps);
+        info.net_send_bps = sum_opt(info.net_send_bps, p.net_send_bps);
     }
     info.gpu_percent = info.gpu_percent.map(|g| g.min(100.0));
     pids.sort_unstable();
@@ -322,7 +338,7 @@ pub fn status_text(state: char) -> &'static str {
     }
 }
 
-pub fn group_row(g: &Group, users: &UserNames) -> [String; 9] {
+pub fn group_row(g: &Group, users: &UserNames) -> [String; 10] {
     let mut row = process_row(&g.info, users);
     if g.pids.len() > 1 {
         row[0] = format!("{} ({})", g.info.name, g.pids.len());
@@ -331,7 +347,7 @@ pub fn group_row(g: &Group, users: &UserNames) -> [String; 9] {
     row
 }
 
-pub fn detail_row(p: &ProcessInfo, users: &UserNames) -> [String; 10] {
+pub fn detail_row(p: &ProcessInfo, users: &UserNames) -> [String; 11] {
     let r = process_row(p, users);
     [
         r[0].clone(),
@@ -343,6 +359,7 @@ pub fn detail_row(p: &ProcessInfo, users: &UserNames) -> [String; 10] {
         r[6].clone(),
         r[7].clone(),
         r[8].clone(),
+        r[9].clone(),
         p.cmdline.as_deref().unwrap_or("").to_string(),
     ]
 }
@@ -473,6 +490,8 @@ mod tests {
             disk_write_bps: None,
             gpu_percent: None,
             gpu_mem_kib: None,
+            net_recv_bps: None,
+            net_send_bps: None,
             cgroup: None,
             cmdline: None,
         }
@@ -576,12 +595,12 @@ mod tests {
         let r = detail_row(&p, &users());
         assert_eq!(r[2], "Sleeping");
         assert_eq!(r[3], "root");
-        assert_eq!(r[9], "sleep 60");
+        assert_eq!(r[10], "sleep 60");
         assert_eq!(
-            SortColumn::from_details_index(9),
+            SortColumn::from_details_index(10),
             Some(SortColumn::CommandLine)
         );
-        assert_eq!(SortColumn::from_details_index(10), None);
+        assert_eq!(SortColumn::from_details_index(11), None);
     }
 
     #[test]
@@ -673,17 +692,25 @@ mod tests {
         let mut p = proc(1, "a", 0, 0.0, 100);
         let row = process_row(&p, &u);
         assert_eq!(
-            (row[4].as_str(), row[6].as_str(), row[7].as_str()),
-            (UNKNOWN, UNKNOWN, UNKNOWN)
+            (
+                row[4].as_str(),
+                row[6].as_str(),
+                row[7].as_str(),
+                row[8].as_str()
+            ),
+            (UNKNOWN, UNKNOWN, UNKNOWN, UNKNOWN)
         );
         p.pss_kib = Some(1234);
         p.disk_read_bps = Some(1_000);
         p.disk_write_bps = Some(500);
         p.gpu_percent = Some(12.4);
+        p.net_recv_bps = Some(2_000_000);
+        p.net_send_bps = Some(500_000);
         let row = process_row(&p, &u);
         assert_eq!(row[4], "1,234 K");
         assert_eq!(row[6], "1.5 KB/s");
-        assert_eq!(row[7], "12%");
+        assert_eq!(row[7], "2.5 MB/s");
+        assert_eq!(row[8], "12%");
     }
 
     #[test]
@@ -696,6 +723,7 @@ mod tests {
         a.disk_write_bps = Some(900);
         b.disk_read_bps = Some(100);
         a.gpu_percent = Some(80.0);
+        b.net_recv_bps = Some(10);
         let order = |col| {
             let mut v = vec![a.clone(), b.clone()];
             sort_processes(
@@ -711,6 +739,7 @@ mod tests {
         assert_eq!(order(SortColumn::Memory), [2, 1]);
         assert_eq!(order(SortColumn::Disk), [1, 2]);
         assert_eq!(order(SortColumn::Gpu), [1, 2]);
+        assert_eq!(order(SortColumn::Network), [2, 1]);
     }
 
     #[test]

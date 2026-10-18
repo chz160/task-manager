@@ -3,6 +3,7 @@
 
 mod app;
 mod gpu;
+mod net;
 mod services;
 mod startup;
 
@@ -11,6 +12,7 @@ pub use services::{ServiceInfo, list_services};
 pub use startup::{StartupDirs, StartupEntry, list_startup, set_startup_enabled};
 
 use gpu::GpuCounters;
+use net::NetTracker;
 use procfs::{CpuTime, Current, CurrentSI, KernelStats, Meminfo};
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -67,6 +69,10 @@ pub struct ProcessInfo {
     /// ours to inspect or the driver does not expose DRM fdinfo.
     pub gpu_percent: Option<f64>,
     pub gpu_mem_kib: Option<u64>,
+    /// TCP bytes per second received / sent. `None` when the kernel's `sock_diag` is not
+    /// available or the process's fd table cannot be read (another user's, when not root).
+    pub net_recv_bps: Option<u64>,
+    pub net_send_bps: Option<u64>,
     /// Unified-hierarchy cgroup path, e.g. `/user.slice/.../app-gnome-firefox-1.scope`.
     pub cgroup: Option<Arc<str>>,
     /// Arguments joined by spaces; `None` for kernel threads and unreadable processes.
@@ -145,6 +151,7 @@ struct Extras {
     gpu_prev: Option<GpuCounters>,
     gpu_percent: Option<f64>,
     gpu_mem_kib: Option<u64>,
+    net: Option<(u64, u64)>,
     /// Round at which the fd table was last scanned for GPU clients.
     gpu_checked: Option<u64>,
 }
@@ -402,6 +409,7 @@ pub struct Sampler {
     extras_interval: Option<Duration>,
     last_extras: Option<Instant>,
     extras_round: u64,
+    net: NetTracker,
 }
 
 impl Sampler {
@@ -448,6 +456,8 @@ impl Sampler {
         let mut processes = Vec::with_capacity(self.prev_procs.len());
         let mut path = String::with_capacity(32);
         let mut buf = [0u8; 4096];
+        let mut net_scan: Vec<i32> = Vec::new();
+        let mut keys: Vec<(i32, u64)> = Vec::with_capacity(self.prev_procs.len());
         for pid in list_pids()? {
             // Processes can exit between listing and reading; skip them.
             let Some(stat) = read_stat(pid, &mut path, &mut buf) else {
@@ -485,6 +495,10 @@ impl Sampler {
                     &mut extras,
                 );
             }
+            if inspectable && extras_due {
+                net_scan.push(pid);
+            }
+            keys.push(key);
             processes.push(ProcessInfo {
                 pid: stat.pid,
                 ppid: stat.ppid,
@@ -499,6 +513,8 @@ impl Sampler {
                 disk_write_bps: extras.disk_write_bps,
                 gpu_percent: extras.gpu_percent,
                 gpu_mem_kib: extras.gpu_mem_kib,
+                net_recv_bps: extras.net.map(|n| n.0),
+                net_send_bps: extras.net.map(|n| n.1),
                 cgroup: cgroup.clone(),
                 cmdline: cmdline.clone(),
             });
@@ -512,6 +528,18 @@ impl Sampler {
                     extras,
                 },
             );
+        }
+
+        if extras_due {
+            // `None` from the tracker means no sock_diag: every process then shows no value.
+            let rates = self.net.update(&net_scan, elapsed);
+            for (p, key) in processes.iter_mut().zip(&keys) {
+                if let Some(e) = next_procs.get_mut(key) {
+                    e.extras.net = rates.as_ref().and_then(|r| r.get(&p.pid).copied());
+                    p.net_recv_bps = e.extras.net.map(|n| n.0);
+                    p.net_send_bps = e.extras.net.map(|n| n.1);
+                }
+            }
         }
 
         let mi = Meminfo::current()?;

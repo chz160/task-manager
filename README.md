@@ -33,6 +33,10 @@ sudo install -m 644 packaging/org.taskmanager.end-process.policy /usr/share/polk
 
 Without it pkexec still works with polkit's generic prompt. Note the policy covers `/usr/bin/kill` as a whole, as `sudo kill` would; a dedicated signal helper is a possible later hardening.
 
+### Network column
+
+The **Network** column (Processes and Details) shows each process's TCP receive plus send rate. It needs no root and no setup: the kernel's `sock_diag` netlink interface hands any user per-socket byte counters, and a socket is matched to its process through `/proc/<pid>/fd`, which is readable for your own processes (all processes if the GUI runs as root). Other users' processes, and systems where `sock_diag` is unavailable (some containers or sandboxes), show "—". UDP traffic is not counted because the kernel keeps no byte counters for it. Rates refresh with the other slow readings (every 5 s).
+
 ### Performance budget
 
 `scripts/perf-check.sh target/release/tm-gui` starts Xvfb and about 1,000 processes, runs the release binary at the default 1 s refresh and fails if it uses 2% or more of one core. It also prints the floor: merely reading `/proc/<pid>/stat` for 1,000 processes costs about 0.9% of a core per second on a GitHub runner, so the original 1% target was not reachable at a 1 s refresh. The GUI measures about 1.6% there, roughly 0.7% above that floor. CI runs it and uploads the release binary as an artifact.

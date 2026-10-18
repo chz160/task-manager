@@ -29,16 +29,18 @@ fn main() {
     snap.processes
         .sort_by(|a, b| b.cpu_percent.total_cmp(&a.cpu_percent));
     println!(
-        "{:>7} {:>6} {:>10} {:>3} NAME",
-        "PID", "CPU%", "RSS(MiB)", "S"
+        "{:>7} {:>6} {:>10} {:>3} {:>10} {:>10} NAME",
+        "PID", "CPU%", "RSS(MiB)", "S", "NET RX B/s", "NET TX B/s"
     );
     for p in snap.processes.iter().take(top) {
         println!(
-            "{:>7} {:>6.1} {:>10.1} {:>3} {}",
+            "{:>7} {:>6.1} {:>10.1} {:>3} {:>10} {:>10} {}",
             p.pid,
             p.cpu_percent,
             p.rss_kib as f64 / 1024.0,
             p.state,
+            p.net_recv_bps.map_or("-".into(), |n| n.to_string()),
+            p.net_send_bps.map_or("-".into(), |n| n.to_string()),
             p.name
         );
     }

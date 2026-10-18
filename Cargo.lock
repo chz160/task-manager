@@ -4149,6 +4149,7 @@ dependencies = [
 name = "tm-core"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "procfs",
  "zbus",
 ]
