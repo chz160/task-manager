@@ -60,6 +60,10 @@ export component MainWindow inherits Window {
     in property <string> startup-action: "Disable";
     in property <[[StandardListViewItem]]> service-rows;
     in property <string> services-message;
+    in-out property <int> service-selected-row: -1;
+    in property <bool> service-can-start;
+    in property <bool> service-can-stop;
+    in property <bool> service-busy;
     in property <[[StandardListViewItem]]> user-rows;
     in-out property <int> selected-row: -1;
     in-out property <int> detail-selected-row: -1;
@@ -88,6 +92,9 @@ export component MainWindow inherits Window {
     callback startup-toggled();
     callback services-ready();
     callback service-sorted(int, bool);
+    callback service-row-selected(int);
+    callback service-action(int);
+    callback service-action-done();
     callback group-toggled(bool);
     callback end-process-clicked(int);
     callback end-process-confirmed();
@@ -273,8 +280,29 @@ export component MainWindow inherits Window {
                             { title: "Status", min-width: 90px },
                         ];
                         rows: root.service-rows;
+                        current-row <=> root.service-selected-row;
                         sort-ascending(c) => { root.service-sorted(c, true); }
                         sort-descending(c) => { root.service-sorted(c, false); }
+                        current-row-changed(r) => { root.service-row-selected(r); }
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: end;
+                        Button {
+                            text: "Start";
+                            enabled: root.service-can-start && !root.service-busy;
+                            clicked => { root.service-action(0); }
+                        }
+                        Button {
+                            text: "Stop";
+                            enabled: root.service-can-stop && !root.service-busy;
+                            clicked => { root.service-action(1); }
+                        }
+                        Button {
+                            text: "Restart";
+                            enabled: root.service-can-stop && !root.service-busy;
+                            clicked => { root.service-action(2); }
+                        }
                     }
                 }
             }
