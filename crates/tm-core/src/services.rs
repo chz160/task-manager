@@ -132,7 +132,7 @@ fn services_from_units(units: Vec<Unit>) -> Vec<ServiceInfo> {
             }
             Some(ServiceInfo {
                 name: id.strip_suffix(".service")?.to_string(),
-                description,
+                description: crate::single_line(description),
                 active_state: active,
                 sub_state: sub,
             })
