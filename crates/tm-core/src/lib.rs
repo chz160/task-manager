@@ -240,6 +240,19 @@ fn read_cmdline(pid: i32) -> Option<Arc<str>> {
     parse_cmdline(&buf, buf.len() >= CMDLINE_MAX).map(Arc::from)
 }
 
+/// Replaces every control character (newline, tab, escape, ...) with a space so the text
+/// fits on one table row. Text without control characters is returned unchanged.
+pub(crate) fn single_line(s: impl Into<String>) -> String {
+    let s = s.into();
+    if s.chars().any(char::is_control) {
+        s.chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect()
+    } else {
+        s
+    }
+}
+
 /// Arguments are NUL-separated. Kernel threads have none.
 fn parse_cmdline(raw: &[u8], truncated: bool) -> Option<String> {
     let mut args: Vec<&[u8]> = raw.split(|b| *b == 0).collect();
@@ -249,11 +262,13 @@ fn parse_cmdline(raw: &[u8], truncated: bool) -> Option<String> {
     if args.is_empty() {
         return None;
     }
-    let mut out = args
+    let joined = args
         .iter()
         .map(|a| String::from_utf8_lossy(a))
         .collect::<Vec<_>>()
         .join(" ");
+    // A command line can hold newlines (`sh -c` scripts); they would stretch the row.
+    let mut out = single_line(joined);
     if truncated {
         out.push('…');
     }
@@ -363,7 +378,7 @@ fn parse_stat(raw: &[u8]) -> Option<StatLine> {
         .trim()
         .parse()
         .ok()?;
-    let comm = String::from_utf8_lossy(raw.get(open + 1..close)?).into_owned();
+    let comm = single_line(String::from_utf8_lossy(raw.get(open + 1..close)?));
     let rest = std::str::from_utf8(raw.get(close + 1..)?).ok()?;
     // Fields after comm, numbered from the state (field 3 in proc(5)).
     let mut f = rest.split_ascii_whitespace();
@@ -654,6 +669,10 @@ mod tests {
             Some("/usr/bin/foo --bar baz")
         );
         assert_eq!(parse_cmdline(b"", false), None);
+        assert_eq!(
+            parse_cmdline(b"sh\0-c\0echo a\nb\tc\r\n\0", false).as_deref(),
+            Some("sh -c echo a b c  ")
+        );
         assert_eq!(parse_cmdline(b"abc\0", true).as_deref(), Some("abc…"));
     }
 
