@@ -90,7 +90,7 @@ fn parse_entry(id: &str, text: &str, user: bool, desktops: &[String]) -> Option<
     if list_has(kv.get("NotShowIn"), desktops) {
         return None;
     }
-    let exec = kv.get("Exec")?.to_string();
+    let exec = crate::single_line(kv.get("Exec")?);
     let enabled = !is_true(kv.get("Hidden"))
         && !kv
             .get("X-GNOME-Autostart-enabled")
@@ -99,7 +99,7 @@ fn parse_entry(id: &str, text: &str, user: bool, desktops: &[String]) -> Option<
         id: id.to_string(),
         name: kv
             .get("Name")
-            .map(|n| n.to_string())
+            .map(|n| crate::single_line(n))
             .unwrap_or_else(|| id.trim_end_matches(".desktop").to_string()),
         exec,
         enabled,
