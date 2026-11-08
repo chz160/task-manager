@@ -242,7 +242,7 @@ fn read_cmdline(pid: i32) -> Option<Arc<str>> {
 
 /// Replaces every control character (newline, tab, escape, ...) with a space so the text
 /// fits on one table row. Text without control characters is returned unchanged.
-pub fn single_line(s: impl Into<String>) -> String {
+pub(crate) fn single_line(s: impl Into<String>) -> String {
     let s = s.into();
     if s.chars().any(char::is_control) {
         s.chars()
