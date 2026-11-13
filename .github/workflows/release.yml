@@ -1,0 +1,171 @@
+# Builds the x86_64 .deb and tarball, install-tests the .deb in clean containers,
+# then publishes:
+#   - a push of a v* tag    -> a normal GitHub Release (the tag must match the workspace version)
+#   - a push to main        -> the rolling "nightly" prerelease, replaced on every push
+# Pull requests that touch packaging build and install-test the packages but
+# publish nothing; ci.yml covers everything else.
+name: Release
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "packaging/**"
+      - "Cargo.toml"
+      - "crates/*/Cargo.toml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # 22.04 (glibc 2.35) sets the oldest distro the binary runs on: Mint 21+, Debian 12+.
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      channel: ${{ steps.meta.outputs.channel }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Work out the version
+        id: meta
+        run: |
+          cargo_version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="tm-gui"))')
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag_version=${GITHUB_REF_NAME#v}
+            if [[ "$tag_version" != "$cargo_version" ]]; then
+              echo "::error::Tag $GITHUB_REF_NAME does not match the workspace version $cargo_version"
+              exit 1
+            fi
+            echo "channel=release" >> "$GITHUB_OUTPUT"
+            echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
+            echo "deb_version=$cargo_version-1" >> "$GITHUB_OUTPUT"
+          else
+            stamp="$(date -u +%Y%m%d).${GITHUB_SHA::7}"
+            echo "channel=nightly" >> "$GITHUB_OUTPUT"
+            echo "version=$cargo_version-nightly.$stamp" >> "$GITHUB_OUTPUT"
+            # "~" sorts below the release in dpkg, so 0.2.0 upgrades 0.2.0~nightly...
+            echo "deb_version=$cargo_version~nightly.$stamp" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install build libraries and Xvfb (for the CPU budget check)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig1-dev xvfb libxkbcommon-x11-0 fonts-dejavu-core
+      - run: cargo build --release --workspace --locked
+      - name: CPU budget on the release binary
+        run: scripts/perf-check.sh target/release/tm-gui
+      - run: cargo install cargo-deb --version 3.8.0 --locked
+      - name: Build the .deb
+        run: |
+          mkdir -p dist
+          cargo deb -p tm-gui --no-build --deb-version '${{ steps.meta.outputs.deb_version }}' \
+            --output "dist/task-manager_${{ steps.meta.outputs.version }}_amd64.deb"
+      - name: Build the tarball
+        run: |
+          name="task-manager-${{ steps.meta.outputs.version }}-x86_64-linux"
+          root="stage/$name"
+          install -Dm755 target/release/tm-gui "$root/usr/bin/tm-gui"
+          install -Dm755 target/release/tm-cli "$root/usr/bin/tm-cli"
+          install -Dm644 packaging/org.taskmanager.end-process.policy "$root/usr/share/polkit-1/actions/org.taskmanager.end-process.policy"
+          install -Dm644 packaging/task-manager.desktop "$root/usr/share/applications/task-manager.desktop"
+          install -Dm644 packaging/task-manager.svg "$root/usr/share/icons/hicolor/scalable/apps/task-manager.svg"
+          install -Dm644 LICENSE "$root/LICENSE"
+          cat > "$root/INSTALL" <<'TXT'
+          Task Manager for Linux (x86_64, needs glibc 2.35 or newer)
+
+          Unpack, then run usr/bin/tm-gui (window) or usr/bin/tm-cli (terminal table).
+          Needs libfontconfig, libx11, libxcursor, libxi, libxkbcommon(-x11) and
+          libwayland-client, which any desktop install has.
+
+          To install system-wide, copy the usr/ folder into /usr (or /usr/local):
+              sudo cp -r usr/. /usr/
+          The polkit policy in usr/share/polkit-1/actions/ gives the End Process
+          password prompt a clear text; without it polkit shows its generic prompt.
+          TXT
+          tar -C stage --owner=0 --group=0 -czf "dist/$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
+
+  install-test:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["ubuntu:22.04", "ubuntu:24.04", "debian:12"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v5
+        with:
+          name: dist
+          path: dist
+      - name: Install the .deb in a clean ${{ matrix.image }} container and start both programs
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work -e DEBIAN_FRONTEND=noninteractive ${{ matrix.image }} bash -euxo pipefail -c '
+            apt-get update
+            # xvfb and fonts are only for the smoke test; the package must pull in everything else
+            apt-get install -y xvfb fonts-dejavu-core procps desktop-file-utils
+            apt-get install -y ./dist/task-manager_*.deb
+            command -v tm-gui tm-cli
+            test -f /usr/share/polkit-1/actions/org.taskmanager.end-process.policy
+            grep -q "<allow_active>auth_admin</allow_active>" /usr/share/polkit-1/actions/org.taskmanager.end-process.policy
+            desktop-file-validate /usr/share/applications/task-manager.desktop
+            test -f /usr/share/icons/hicolor/scalable/apps/task-manager.svg
+            test -f /usr/share/doc/task-manager/copyright
+            # a running program is killed by timeout (124); anything else is a crash
+            rc=0; timeout 4 tm-cli 1 5 > /tmp/cli.out || rc=$?
+            test "$rc" = 0 -o "$rc" = 124
+            test -s /tmp/cli.out
+            rc=0; xvfb-run -a timeout 6 tm-gui || rc=$?
+            test "$rc" = 124
+            apt-get remove -y task-manager
+            ! command -v tm-gui
+          '
+
+  publish:
+    if: github.event_name == 'push'
+    needs: [build, install-test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    concurrency:
+      group: release-${{ needs.build.outputs.channel }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: dist
+          path: dist
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum -- * | tee SHA256SUMS
+      - uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/*
+      - name: Publish a release for the tag
+        if: needs.build.outputs.channel == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes \
+            --title "Task Manager $GITHUB_REF_NAME"
+      - name: Refresh the nightly prerelease
+        if: needs.build.outputs.channel == 'nightly'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # Delete and recreate so old file names (they carry the date and commit) do not pile up.
+          gh release delete nightly --cleanup-tag --yes || true
+          gh release create nightly dist/* --prerelease --target "$GITHUB_SHA" \
+            --title "Nightly build of ${GITHUB_SHA::7}" \
+            --notes "Automatic build of the latest main (${GITHUB_SHA}). Not a stable release; see the Releases page for those."
