@@ -2,6 +2,12 @@
 resolver = "2"
 members = ["crates/tm-core", "crates/tm-cli", "crates/tm-gui"]
 
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/chz160/task-manager"
+
 [profile.release]
 lto = true
 codegen-units = 1

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Task Manager
+GenericName=System Monitor
+Comment=See and end running programs, and watch CPU, memory, disk and network use
+Exec=tm-gui
+Icon=task-manager
+Terminal=false
+Categories=System;Monitor;
+Keywords=task;process;kill;cpu;memory;monitor;
+StartupWMClass=tm-gui
+X-KDE-Shortcuts=Ctrl+Shift+Esc

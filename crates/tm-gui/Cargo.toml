@@ -1,8 +1,10 @@
 [package]
 name = "tm-gui"
-version = "0.1.0"
-edition = "2024"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A zero-bloat Task Manager for Linux, modelled on the one Windows shipped before Windows 11"
 build = "build.rs"
 
 [dependencies]
@@ -13,3 +15,26 @@ slint = { version = "1", default-features = false, features = ["std", "backend-w
 
 [build-dependencies]
 slint-build = "1"
+
+# Debian package, built with `cargo deb -p tm-gui` after `cargo build --release --workspace`.
+# winit loads the X11/Wayland/xkbcommon libraries with dlopen, so dpkg-shlibdeps
+# cannot see them and they are listed by hand next to the automatic ones.
+[package.metadata.deb]
+name = "task-manager"
+maintainer = "Noah P. <chz160@yahoo.com>"
+section = "utils"
+priority = "optional"
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+A zero-bloat Task Manager for Linux, modelled on the one Windows shipped before
+Windows 11: processes, performance graphs, users, services and startup programs
+in a small native window. Installs the tm-gui window and the tm-cli table."""
+depends = "$auto, libxkbcommon0, libxkbcommon-x11-0, libx11-6, libx11-xcb1, libxcursor1, libxi6, libwayland-client0"
+recommends = "pkexec | policykit-1"
+assets = [
+    ["target/release/tm-gui", "usr/bin/", "755"],
+    ["target/release/tm-cli", "usr/bin/", "755"],
+    ["../../packaging/org.taskmanager.end-process.policy", "usr/share/polkit-1/actions/", "644"],
+    ["../../packaging/task-manager.desktop", "usr/share/applications/", "644"],
+    ["../../packaging/task-manager.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+]
