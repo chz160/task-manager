@@ -2,10 +2,11 @@
 <!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
  "http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig.dtd">
 <!--
-  Install to /usr/share/polkit-1/actions/. tm-gui ends other users' processes
-  with `pkexec /usr/bin/kill -TERM -- <pid>`; this gives that call a clear
-  prompt. Without this file pkexec falls back to polkit's generic
-  "run a program as another user" action, which also works but reads worse.
+  Installed to /usr/share/polkit-1/actions/ by the .deb (or copy it there by
+  hand). tm-gui ends other users' processes by running pkexec on /usr/bin/kill
+  with the TERM signal; this gives that call a clear prompt. Without this file
+  pkexec falls back to polkit's generic "run a program as another user" action,
+  which also works but reads worse.
 -->
 <policyconfig>
   <vendor>Task Manager</vendor>
@@ -15,7 +16,7 @@
     <defaults>
       <allow_any>auth_admin</allow_any>
       <allow_inactive>auth_admin</allow_inactive>
-      <allow_active>auth_admin_keep</allow_active>
+      <allow_active>auth_admin</allow_active>
     </defaults>
     <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/kill</annotate>
   </action>
