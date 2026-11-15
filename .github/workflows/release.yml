@@ -101,7 +101,7 @@ jobs:
         image: ["ubuntu:22.04", "ubuntu:24.04", "debian:12"]
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist
@@ -140,7 +140,7 @@ jobs:
       group: release-${{ needs.build.outputs.channel }}
       cancel-in-progress: false
     steps:
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist
