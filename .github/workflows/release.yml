@@ -147,7 +147,7 @@ jobs:
       - name: Checksums
         working-directory: dist
         run: sha256sum -- * | tee SHA256SUMS
-      - uses: actions/attest-build-provenance@v3
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/*
       - name: Publish a release for the tag
